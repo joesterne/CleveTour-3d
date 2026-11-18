@@ -1,0 +1,6 @@
+{
+  "name": "CleveTour 3D — Cleveland Historical AR & Walking Guide",
+  "description": "Interactive 3D and AR walking tour of Cleveland's iconic landmarks with Google Maps pedestrian routing, location-based historical notifications, offline district packs, and ViroReact cross-platform export.",
+  "requestFramePermissions": ["geolocation", "camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

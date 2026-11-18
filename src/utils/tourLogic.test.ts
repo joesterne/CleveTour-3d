@@ -1,0 +1,306 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  calculateHaversineDistanceMeters,
+  calculateCompassBearing,
+  estimateWalkingMinutes,
+  evaluateProximityGeofences,
+  interpolateTrailPosition,
+  calculateOfflinePackStats,
+  filterARFactsByEra,
+  generateViroReactSceneCode,
+  evaluatePassportBadges,
+  detectNewlyUnlockedBadges,
+  buildLandmarkNarrationScript,
+  convertFahrenheitToCelsius,
+  formatTemperatureDisplay,
+  describeWmoWeatherCode,
+  evaluateWalkingPreparationAdvisory,
+  parseOpenMeteoForecastResponse,
+} from './tourLogic';
+import {
+  CLEVELAND_LANDMARKS,
+  OFFLINE_DISTRICT_PACKS,
+  CLEVELAND_PASSPORT_BADGES,
+} from '../data/clevelandLandmarks';
+
+test('calculateHaversineDistanceMeters computes accurate distance between Terminal Tower and The Arcade', () => {
+  const terminalTower = CLEVELAND_LANDMARKS[0].tourAnchor;
+  const theArcade = CLEVELAND_LANDMARKS[1].tourAnchor;
+  const distance = calculateHaversineDistanceMeters(terminalTower, theArcade);
+  // ~330m straight-line distance across Public Square / Euclid Ave
+  assert.ok(distance > 250 && distance < 450, `Expected ~330m, got ${distance}m`);
+});
+
+test('calculateCompassBearing returns NE bearing from Terminal Tower to The Arcade', () => {
+  const terminalTower = CLEVELAND_LANDMARKS[0].tourAnchor;
+  const theArcade = CLEVELAND_LANDMARKS[1].tourAnchor;
+  const bearing = calculateCompassBearing(terminalTower, theArcade);
+  assert.equal(bearing.cardinal, 'NE');
+  assert.ok(bearing.degrees >= 35 && bearing.degrees <= 75);
+});
+
+test('estimateWalkingMinutes calculates pedestrian walk time with Naismith elevation adjustment', () => {
+  assert.equal(estimateWalkingMinutes(0), 0);
+  assert.equal(estimateWalkingMinutes(450, 5), 6);
+  assert.equal(estimateWalkingMinutes(950, 0), 12);
+});
+
+test('evaluateProximityGeofences triggers push notification only when inside geofence and not yet notified', () => {
+  const nearRockHall = { lat: 41.5082, lng: -81.6951 };
+  const alertsFirst = evaluateProximityGeofences(
+    nearRockHall,
+    CLEVELAND_LANDMARKS,
+    [],
+    180
+  );
+  assert.equal(alertsFirst.length, 1);
+  assert.equal(alertsFirst[0].landmarkId, 'rock-hall');
+  assert.ok(alertsFirst[0].distanceMeters < 100);
+
+  // Deduplication check when already notified
+  const alertsSecond = evaluateProximityGeofences(
+    nearRockHall,
+    CLEVELAND_LANDMARKS,
+    ['rock-hall'],
+    180
+  );
+  assert.equal(alertsSecond.length, 0);
+});
+
+test('interpolateTrailPosition smoothly interpolates coordinates along the Cleveland walking path', () => {
+  const startStep = interpolateTrailPosition(CLEVELAND_LANDMARKS, 0);
+  assert.equal(startStep.nearestLandmarkId, 'terminal-tower');
+
+  const midStep = interpolateTrailPosition(CLEVELAND_LANDMARKS, 2.1);
+  assert.equal(midStep.nearestLandmarkId, 'rock-hall');
+  assert.ok(midStep.position.lat > 41.5);
+});
+
+test('calculateOfflinePackStats computes MB totals and landmark offline coverage accurately', () => {
+  const stats = calculateOfflinePackStats(
+    OFFLINE_DISTRICT_PACKS,
+    ['downtown-public-square', 'ohio-city-bridges'],
+    CLEVELAND_LANDMARKS.length
+  );
+  assert.equal(stats.offlineLandmarksCovered, 4);
+  assert.equal(stats.coveragePercent, 67);
+  assert.equal(stats.isLandmarkAvailableOffline('terminal-tower'), true);
+  assert.equal(stats.isLandmarkAvailableOffline('rock-hall'), false);
+  assert.ok(stats.downloadedMb > 50);
+});
+
+test('filterARFactsByEra filters historical facts by year slider and category', () => {
+  const facts = CLEVELAND_LANDMARKS[0].arFacts; // 1930, 1931, 1894
+  const pre1900 = filterARFactsByEra(facts, 1900, 'ALL');
+  assert.equal(pre1900.length, 1);
+  assert.equal(pre1900[0].year, 1894);
+
+  const engOnly = filterARFactsByEra(facts, 2026, 'Engineering');
+  assert.equal(engOnly.length, 1);
+  assert.equal(engOnly[0].year, 1930);
+});
+
+test('generateViroReactSceneCode outputs valid ViroARSceneNavigator and ViroNode JSX for landmark', () => {
+  const code = generateViroReactSceneCode(CLEVELAND_LANDMARKS[4]); // Guardians of Traffic
+  assert.ok(code.includes('ViroARSceneNavigator'));
+  assert.ok(code.includes('Guardians of Traffic'));
+  assert.ok(code.includes('1932 Berea Stone Carving'));
+});
+
+test('evaluatePassportBadges calculates district sticker unlocks and visual progress percentages accurately', () => {
+  // 1 of 2 visited in Downtown district -> 17% overall, 50% Downtown badge, 0 unlocked
+  const initialProgress = evaluatePassportBadges(
+    CLEVELAND_LANDMARKS,
+    CLEVELAND_PASSPORT_BADGES,
+    ['terminal-tower']
+  );
+  assert.equal(initialProgress.visitedLandmarksCount, 1);
+  assert.equal(initialProgress.totalLandmarks, 6);
+  assert.equal(initialProgress.overallProgressPercent, 17);
+  assert.equal(initialProgress.unlockedBadgesCount, 0);
+  assert.equal(initialProgress.badges[0].progressPercent, 50);
+  assert.equal(initialProgress.badges[0].isUnlocked, false);
+  assert.deepEqual(initialProgress.badges[0].missingLandmarkIds, ['the-arcade']);
+
+  // Visit both landmarks in Downtown district -> Downtown sticker unlocks!
+  const downtownProgress = evaluatePassportBadges(
+    CLEVELAND_LANDMARKS,
+    CLEVELAND_PASSPORT_BADGES,
+    ['terminal-tower', 'the-arcade']
+  );
+  assert.equal(downtownProgress.visitedLandmarksCount, 2);
+  assert.equal(downtownProgress.overallProgressPercent, 33);
+  assert.equal(downtownProgress.unlockedBadgesCount, 1);
+  assert.equal(downtownProgress.districtBadgesUnlockedCount, 1);
+  assert.equal(downtownProgress.badges[0].isUnlocked, true);
+  assert.equal(downtownProgress.badges[0].progressPercent, 100);
+  assert.equal(downtownProgress.explorerRankTitle, 'District Heritage Pioneer');
+
+  // Visit all 6 landmarks -> All 3 district stickers + Grand Laureate sticker unlock (4 of 4)
+  const fullProgress = evaluatePassportBadges(
+    CLEVELAND_LANDMARKS,
+    CLEVELAND_PASSPORT_BADGES,
+    CLEVELAND_LANDMARKS.map((l) => l.id)
+  );
+  assert.equal(fullProgress.overallProgressPercent, 100);
+  assert.equal(fullProgress.unlockedBadgesCount, 4);
+  assert.equal(fullProgress.districtBadgesUnlockedCount, 3);
+  assert.equal(fullProgress.explorerRankTitle, 'Grand Cleveland Heritage Laureate');
+});
+
+test('detectNewlyUnlockedBadges identifies only newly unlocked district or master stickers on state transition', () => {
+  const newlyUnlocked = detectNewlyUnlockedBadges(
+    ['terminal-tower'],
+    ['terminal-tower', 'the-arcade'],
+    CLEVELAND_LANDMARKS,
+    CLEVELAND_PASSPORT_BADGES
+  );
+  assert.equal(newlyUnlocked.length, 1);
+  assert.equal(newlyUnlocked[0].id, 'badge-downtown-public-square');
+
+  // Completing the final landmark unlocks both the 3rd district badge AND the Grand Master Crest
+  const masterUnlock = detectNewlyUnlockedBadges(
+    [
+      'terminal-tower',
+      'the-arcade',
+      'rock-hall',
+      'harbor-lighthouse',
+      'guardians-of-traffic',
+    ],
+    [
+      'terminal-tower',
+      'the-arcade',
+      'rock-hall',
+      'harbor-lighthouse',
+      'guardians-of-traffic',
+      'west-side-market',
+    ],
+    CLEVELAND_LANDMARKS,
+    CLEVELAND_PASSPORT_BADGES
+  );
+  assert.equal(masterUnlock.length, 2);
+  assert.deepEqual(
+    masterUnlock.map((b) => b.id),
+    ['badge-ohio-city-bridges', 'badge-cleveland-grand-laureate']
+  );
+});
+
+test('buildLandmarkNarrationScript generates complete spoken history script for landmark and individual facts', () => {
+  const terminalTower = CLEVELAND_LANDMARKS[0];
+  const fullPayload = buildLandmarkNarrationScript(terminalTower);
+  assert.equal(fullPayload.landmarkId, 'terminal-tower');
+  assert.equal(fullPayload.factCount, 3);
+  assert.ok(fullPayload.spokenText.includes('Terminal Tower'));
+  assert.ok(fullPayload.spokenText.includes('52 Stories Over the Cuyahoga Valley'));
+  assert.ok(fullPayload.spokenText.includes('Great Lakes Maritime Strobe'));
+  assert.ok(fullPayload.spokenText.includes("Soldiers' and Sailors' Monument"));
+  assert.ok(fullPayload.estimatedDurationSeconds >= 20);
+
+  const singleFactPayload = buildLandmarkNarrationScript(
+    terminalTower,
+    terminalTower.arFacts[0]
+  );
+  assert.equal(singleFactPayload.factId, 'tt-fact-1');
+  assert.equal(singleFactPayload.factCount, 1);
+  assert.ok(singleFactPayload.spokenText.includes('1930 Dedication'));
+  assert.ok(singleFactPayload.spokenText.includes('Height: 215.8m'));
+});
+
+test('describeWmoWeatherCode and formatTemperatureDisplay map weather codes and convert units accurately', () => {
+  assert.equal(convertFahrenheitToCelsius(32), 0);
+  assert.equal(convertFahrenheitToCelsius(68), 20);
+  assert.equal(formatTemperatureDisplay(59, 'F'), '59°F');
+  assert.equal(formatTemperatureDisplay(59, 'C'), '15°C');
+
+  const clear = describeWmoWeatherCode(0);
+  assert.equal(clear.label, 'Clear Lake Erie Sky');
+  assert.equal(clear.iconCategory, 'SUN');
+  assert.equal(clear.isPrecipitation, false);
+
+  const rain = describeWmoWeatherCode(63);
+  assert.equal(rain.label, 'Steady Rain Showers');
+  assert.equal(rain.iconCategory, 'RAIN');
+  assert.equal(rain.isPrecipitation, true);
+});
+
+test('evaluateWalkingPreparationAdvisory produces tailored Cleveland walking advisories for rain, wind, cold, and mild conditions', () => {
+  const optimal = evaluateWalkingPreparationAdvisory({
+    temperatureF: 65,
+    apparentTemperatureF: 64,
+    windSpeedMph: 7,
+    precipitationProbabilityPercent: 10,
+    weatherCode: 1,
+    isLakefrontDistrict: false,
+  });
+  assert.equal(optimal.walkabilityRating, 'Optimal Walking Conditions');
+  assert.equal(optimal.badgeTone, 'emerald');
+  assert.ok(optimal.walkabilityScore >= 85);
+
+  const rainy = evaluateWalkingPreparationAdvisory({
+    temperatureF: 52,
+    apparentTemperatureF: 49,
+    windSpeedMph: 14,
+    precipitationProbabilityPercent: 75,
+    weatherCode: 61,
+    isLakefrontDistrict: false,
+  });
+  assert.equal(rainy.walkabilityRating, 'Wet Pavement — Waterproof Gear');
+  assert.ok(rainy.clothingTip.includes('The Arcade'));
+
+  const lakefrontWind = evaluateWalkingPreparationAdvisory({
+    temperatureF: 58,
+    apparentTemperatureF: 55,
+    windSpeedMph: 16,
+    precipitationProbabilityPercent: 15,
+    weatherCode: 2,
+    isLakefrontDistrict: true,
+  });
+  assert.equal(lakefrontWind.walkabilityRating, 'Breezy Lakefront — Layer Up');
+  assert.equal(lakefrontWind.badgeTone, 'amber');
+});
+
+test('parseOpenMeteoForecastResponse normalizes Open-Meteo JSON into ClevelandWeatherSnapshot with 4-hour walking window', () => {
+  const sampleApiPayload = {
+    latitude: 41.4984,
+    longitude: -81.6937,
+    current: {
+      time: '2026-11-18T11:00',
+      temperature_2m: 48.4,
+      apparent_temperature: 43.2,
+      relative_humidity_2m: 68,
+      precipitation: 0,
+      weather_code: 2,
+      wind_speed_10m: 12.6,
+      wind_direction_10m: 315,
+      wind_gusts_10m: 18.2,
+      is_day: 1,
+    },
+    hourly: {
+      time: [
+        '2026-11-18T10:00',
+        '2026-11-18T11:00',
+        '2026-11-18T12:00',
+        '2026-11-18T13:00',
+        '2026-11-18T14:00',
+      ],
+      temperature_2m: [46.1, 48.4, 50.2, 51.8, 51.0],
+      precipitation_probability: [10, 15, 20, 25, 20],
+      wind_speed_10m: [11.0, 12.6, 13.4, 14.1, 13.0],
+      weather_code: [1, 2, 2, 3, 2],
+    },
+  };
+
+  const parsed = parseOpenMeteoForecastResponse(sampleApiPayload);
+  assert.equal(parsed.temperatureF, 48);
+  assert.equal(parsed.apparentTemperatureF, 43);
+  assert.equal(parsed.windCardinal, 'NW');
+  assert.equal(parsed.condition.label, 'Partly Cloudy');
+  assert.equal(parsed.hourlyForecast.length, 4);
+  assert.equal(parsed.hourlyForecast[0].hourLabel, 'Now');
+  assert.equal(parsed.hourlyForecast[1].hourLabel, '12 PM');
+  assert.equal(parsed.precipitationProbabilityPercent, 15);
+});
+
+
+
