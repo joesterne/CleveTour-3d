@@ -1024,6 +1024,260 @@ export function triggerDeviceHapticFeedback(
   };
 }
 
+export interface GyroOrientationInput {
+  alpha: number | null; // 0..360 Z-axis yaw
+  beta: number | null; // -180..180 X-axis front/back pitch
+  gamma: number | null; // -90..90 Y-axis left/right roll
+  webkitCompassHeading?: number | null; // iOS true magnetic heading if present
+}
+
+export interface CompassSightlineAlignment {
+  deviceHeadingDeg: number; // 0..359
+  deviceCardinal: string;
+  targetLandmarkTitle: string;
+  targetBearingDeg: number; // 0..359
+  targetCardinal: string;
+  relativeNeedleAngleDeg: number; // -180..+180 shortest signed delta to target sight
+  northNeedleAngleDeg: number; // 0..359 rotation for North needle relative to device
+  pitchTiltDeg: number; // Clamped 3D perspective X-tilt for the compass dial
+  rollTiltDeg: number; // Clamped 3D perspective Y-roll for the compass dial
+  isAligned: boolean; // True when within ±12° of target historical sightline
+  alignmentDeltaAbsDeg: number;
+  alignmentInstruction: string;
+}
+
+/**
+ * Computes the canonical historical sightline compass bearing (0-359°) for a landmark
+ * so tourists know which direction to face when inspecting its facade and AR facts.
+ */
+export function computeLandmarkSightlineBearing(
+  selectedLandmark: LandmarkBlueprint,
+  nextLandmark?: LandmarkBlueprint | null
+): { targetBearingDeg: number; targetTitle: string } {
+  // Architectural facade sightline azimuths for each iconic Cleveland landmark
+  const FACADE_SIGHTLINE_BEARINGS: Record<string, number> = {
+    'terminal-tower': 142, // Facing SE across Public Square toward the 708-ft Beaux-Arts spire
+    'the-arcade': 48, // Facing NE along the historic Euclid-Superior skylit atrium axis
+    'rock-hall': 335, // Facing NNW toward I.M. Pei's glass pyramid & Lake Erie horizon
+    'harbor-lighthouse': 295, // Facing WNW toward the 1911 West Pierhead Fresnel beacon
+    'guardians-of-traffic': 248, // Facing WSW along the Hope Memorial Bridge sandstone pylons
+    'west-side-market': 210, // Facing SSW toward the 1912 clock tower & Guastavino concourse
+  };
+
+  if (
+    typeof FACADE_SIGHTLINE_BEARINGS[selectedLandmark.id] === 'number'
+  ) {
+    return {
+      targetBearingDeg: FACADE_SIGHTLINE_BEARINGS[selectedLandmark.id],
+      targetTitle: selectedLandmark.shortTitle,
+    };
+  }
+
+  if (nextLandmark) {
+    const bearing = calculateCompassBearing(
+      selectedLandmark.tourAnchor,
+      nextLandmark.tourAnchor
+    );
+    return {
+      targetBearingDeg: bearing.degrees,
+      targetTitle: nextLandmark.shortTitle,
+    };
+  }
+
+  return {
+    targetBearingDeg: 45,
+    targetTitle: selectedLandmark.shortTitle,
+  };
+}
+
+/**
+ * Converts raw DeviceOrientation gyroscope angles (alpha, beta, gamma) or camera azimuth
+ * into a 3D compass needle state and historical sightline alignment telemetry.
+ */
+export function computeGyroCompassAlignment(params: {
+  gyro: GyroOrientationInput;
+  targetBearingDeg: number;
+  targetLandmarkTitle: string;
+  alignmentThresholdDeg?: number;
+}): CompassSightlineAlignment {
+  const {
+    gyro,
+    targetBearingDeg,
+    targetLandmarkTitle,
+    alignmentThresholdDeg = 12,
+  } = params;
+
+  // Resolve device compass heading (0..359):
+  // If webkitCompassHeading is provided, it is already clockwise from North (0..360).
+  // Standard W3C DeviceOrientation alpha is counter-clockwise (0..360), so compass heading = (360 - alpha) % 360.
+  let rawHeading = 0;
+  if (
+    typeof gyro.webkitCompassHeading === 'number' &&
+    !Number.isNaN(gyro.webkitCompassHeading)
+  ) {
+    rawHeading = gyro.webkitCompassHeading;
+  } else if (typeof gyro.alpha === 'number' && !Number.isNaN(gyro.alpha)) {
+    rawHeading = (360 - (gyro.alpha % 360) + 360) % 360;
+  }
+
+  const deviceHeadingDeg = Math.round(((rawHeading % 360) + 360) % 360) % 360;
+  const normalizedTargetDeg =
+    Math.round(((targetBearingDeg % 360) + 360) % 360) % 360;
+
+  const deviceCardinal = degreesToCardinalWind(deviceHeadingDeg);
+  const targetCardinal = degreesToCardinalWind(normalizedTargetDeg);
+
+  // Shortest signed angular difference from deviceHeadingDeg to normalizedTargetDeg (-180..+180)
+  const rawDelta = ((normalizedTargetDeg - deviceHeadingDeg + 540) % 360) - 180;
+  const relativeNeedleAngleDeg =
+    rawDelta === -180 ? 180 : Math.round(rawDelta);
+  const alignmentDeltaAbsDeg = Math.abs(relativeNeedleAngleDeg);
+  const isAligned = alignmentDeltaAbsDeg <= alignmentThresholdDeg;
+
+  const northNeedleAngleDeg = (360 - deviceHeadingDeg) % 360;
+
+  // Map device beta (-180..180, typically 45..85 when holding phone viewing AR) to a 3D compass disc perspective tilt (18°..56°)
+  const rawBeta = typeof gyro.beta === 'number' ? gyro.beta : 55;
+  const pitchTiltDeg = Math.round(
+    Math.max(18, Math.min(56, 56 - (Math.max(0, Math.min(90, rawBeta)) / 90) * 32))
+  );
+
+  // Map device gamma (-90..90) to subtle 3D roll (-24°..+24°)
+  const rawGamma = typeof gyro.gamma === 'number' ? gyro.gamma : 0;
+  const rollTiltDeg = Math.round(Math.max(-24, Math.min(24, rawGamma * 0.5)));
+
+  let alignmentInstruction = `LOCKED ON SIGHTLINE — Aligned with ${targetLandmarkTitle} (${normalizedTargetDeg}° ${targetCardinal})`;
+  if (!isAligned) {
+    const turnDir = relativeNeedleAngleDeg > 0 ? 'Right (CW)' : 'Left (CCW)';
+    alignmentInstruction = `Rotate ${alignmentDeltaAbsDeg}° ${turnDir} to align with ${targetLandmarkTitle} (${normalizedTargetDeg}° ${targetCardinal})`;
+  }
+
+  return {
+    deviceHeadingDeg,
+    deviceCardinal,
+    targetLandmarkTitle,
+    targetBearingDeg: normalizedTargetDeg,
+    targetCardinal,
+    relativeNeedleAngleDeg,
+    northNeedleAngleDeg,
+    pitchTiltDeg,
+    rollTiltDeg,
+    isAligned,
+    alignmentDeltaAbsDeg,
+    alignmentInstruction,
+  };
+}
+
+export type SocialSharePlatform =
+  | 'X_TWITTER'
+  | 'FACEBOOK'
+  | 'LINKEDIN'
+  | 'REDDIT'
+  | 'EMAIL';
+
+export interface ARDiscoverySharePayload {
+  landmarkId: string;
+  landmarkTitle: string;
+  districtName: string;
+  factId: string;
+  factTitle: string;
+  factEraLabel: string;
+  factCategory: string;
+  factNarrative: string;
+  architecturalSpec: string;
+  cameraHeadingDeg: number;
+  cameraCardinal: string;
+  coordinatesLabel: string;
+  shareHeadline: string;
+  shareText: string;
+  hashtags: string[];
+  shareUrl: string;
+  platformUrls: Record<SocialSharePlatform, string>;
+}
+
+/**
+ * Builds a complete social media share payload and platform intent URLs for the tourist's
+ * current 3D AR viewport sightline and selected historical discovery fact.
+ */
+export function buildARDiscoverySharePayload(params: {
+  landmark: LandmarkBlueprint;
+  fact?: ARHistoricalFact | null;
+  cameraHeadingDeg?: number;
+  baseUrl?: string;
+}): ARDiscoverySharePayload {
+  const {
+    landmark,
+    fact,
+    cameraHeadingDeg = 142,
+    baseUrl = 'https://clevetour3d.app',
+  } = params;
+
+  const activeFact: ARHistoricalFact =
+    fact ||
+    landmark.arFacts[0] || {
+      id: `${landmark.id}-overview`,
+      year: landmark.yearCompleted,
+      eraLabel: `${landmark.yearCompleted} Heritage`,
+      title: landmark.shortTitle,
+      narrative: landmark.summary,
+      architecturalSpec: `${landmark.architecturalStyle} · ${landmark.architect}`,
+      arOffset3D: [0, 5, 0],
+      category: 'Architecture',
+    };
+
+  const normalizedHeading =
+    Math.round(((cameraHeadingDeg % 360) + 360) % 360) % 360;
+  const cameraCardinal = degreesToCardinalWind(normalizedHeading);
+  const coordinatesLabel = `${landmark.tourAnchor.lat.toFixed(4)}°N, ${Math.abs(
+    landmark.tourAnchor.lng
+  ).toFixed(4)}°W`;
+
+  const hashtags = ['CleveTour3D', 'ClevelandHistory', 'ViroReactAR', 'ThisIsCLE'];
+  const shareUrl = `${baseUrl.replace(/\/$/, '')}/?landmark=${encodeURIComponent(
+    landmark.id
+  )}&fact=${encodeURIComponent(activeFact.id)}&heading=${normalizedHeading}`;
+
+  const shareHeadline = `Exploring ${landmark.shortTitle} in 3D AR (${activeFact.eraLabel}: ${activeFact.title})`;
+  const shareText = `Exploring ${landmark.shortTitle} (${landmark.districtName}) in 3D AR! [${activeFact.eraLabel} · ${activeFact.category}] ${activeFact.title}: "${activeFact.narrative}" (Sightline ${normalizedHeading}° ${cameraCardinal} · GPS ${coordinatesLabel})`;
+
+  const encodedText = encodeURIComponent(shareText);
+  const encodedUrl = encodeURIComponent(shareUrl);
+  const encodedHeadline = encodeURIComponent(shareHeadline);
+  const encodedHashtags = encodeURIComponent(hashtags.join(','));
+
+  const platformUrls: Record<SocialSharePlatform, string> = {
+    X_TWITTER: `https://twitter.com/intent/tweet?text=${encodedText}&url=${encodedUrl}&hashtags=${encodedHashtags}`,
+    FACEBOOK: `https://www.facebook.com/sharer/sharer.php?u=${encodedUrl}&quote=${encodedText}`,
+    LINKEDIN: `https://www.linkedin.com/sharing/share-offsite/?url=${encodedUrl}`,
+    REDDIT: `https://www.reddit.com/submit?url=${encodedUrl}&title=${encodedHeadline}`,
+    EMAIL: `mailto:?subject=${encodedHeadline}&body=${encodeURIComponent(
+      `${shareText}\n\nExplore in 3D AR: ${shareUrl}`
+    )}`,
+  };
+
+  return {
+    landmarkId: landmark.id,
+    landmarkTitle: landmark.shortTitle,
+    districtName: landmark.districtName,
+    factId: activeFact.id,
+    factTitle: activeFact.title,
+    factEraLabel: activeFact.eraLabel,
+    factCategory: activeFact.category,
+    factNarrative: activeFact.narrative,
+    architecturalSpec: activeFact.architecturalSpec,
+    cameraHeadingDeg: normalizedHeading,
+    cameraCardinal,
+    coordinatesLabel,
+    shareHeadline,
+    shareText,
+    hashtags,
+    shareUrl,
+    platformUrls,
+  };
+}
+
+
+
 
 
 

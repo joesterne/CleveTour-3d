@@ -19,6 +19,9 @@ import {
   parseOpenMeteoForecastResponse,
   buildHapticFeedbackPulse,
   triggerDeviceHapticFeedback,
+  computeLandmarkSightlineBearing,
+  computeGyroCompassAlignment,
+  buildARDiscoverySharePayload,
 } from './tourLogic';
 import {
   CLEVELAND_LANDMARKS,
@@ -372,6 +375,74 @@ test('buildHapticFeedbackPulse and triggerDeviceHapticFeedback generate distinct
   assert.equal(mutedResult.didVibrate, false);
   assert.equal(recordedPatterns.length, 3);
 });
+
+test('computeLandmarkSightlineBearing and computeGyroCompassAlignment calculate 3D compass needle angles and sightline lock accurately', () => {
+  const arcadeSight = computeLandmarkSightlineBearing(CLEVELAND_LANDMARKS[1]); // The Arcade (48° NE)
+  assert.equal(arcadeSight.targetBearingDeg, 48);
+  assert.equal(arcadeSight.targetTitle, 'The Arcade Cleveland');
+
+  // Case 1: Phone gyroscope alpha = 312° -> compass heading = (360 - 312) = 48° NE -> exact sightline lock!
+  const locked = computeGyroCompassAlignment({
+    gyro: { alpha: 312, beta: 60, gamma: 10 },
+    targetBearingDeg: arcadeSight.targetBearingDeg,
+    targetLandmarkTitle: arcadeSight.targetTitle,
+  });
+  assert.equal(locked.deviceHeadingDeg, 48);
+  assert.equal(locked.deviceCardinal, 'NE');
+  assert.equal(locked.relativeNeedleAngleDeg, 0);
+  assert.equal(locked.isAligned, true);
+  assert.ok(locked.alignmentInstruction.includes('LOCKED ON SIGHTLINE'));
+  assert.ok(locked.pitchTiltDeg >= 18 && locked.pitchTiltDeg <= 56);
+  assert.equal(locked.rollTiltDeg, 5);
+
+  // Case 2: Phone facing 10° N while target is 48° NE -> need to rotate 38° Right (CW)
+  const offRight = computeGyroCompassAlignment({
+    gyro: { alpha: 350, beta: 45, gamma: -12 },
+    targetBearingDeg: 48,
+    targetLandmarkTitle: 'The Arcade Cleveland',
+  });
+  assert.equal(offRight.deviceHeadingDeg, 10);
+  assert.equal(offRight.relativeNeedleAngleDeg, 38);
+  assert.equal(offRight.isAligned, false);
+  assert.ok(offRight.alignmentInstruction.includes('Rotate 38° Right (CW)'));
+
+  // Case 3: iOS webkitCompassHeading override across 0°/360° wrap-around (facing 15° N, target 335° NNW -> -40° Left CCW)
+  const wrapLeft = computeGyroCompassAlignment({
+    gyro: { alpha: 0, beta: 50, gamma: 0, webkitCompassHeading: 15 },
+    targetBearingDeg: 335,
+    targetLandmarkTitle: 'Rock & Roll Hall of Fame',
+  });
+  assert.equal(wrapLeft.deviceHeadingDeg, 15);
+  assert.equal(wrapLeft.relativeNeedleAngleDeg, -40);
+  assert.equal(wrapLeft.isAligned, false);
+  assert.ok(wrapLeft.alignmentInstruction.includes('Rotate 40° Left (CCW)'));
+});
+
+test('buildARDiscoverySharePayload generates social media intent URLs and formatted 3D AR sightline caption', () => {
+  const terminalTower = CLEVELAND_LANDMARKS[0];
+  const fact = terminalTower.arFacts[0];
+  const payload = buildARDiscoverySharePayload({
+    landmark: terminalTower,
+    fact,
+    cameraHeadingDeg: 142,
+    baseUrl: 'https://clevetour3d.app',
+  });
+
+  assert.equal(payload.landmarkId, 'terminal-tower');
+  assert.equal(payload.factId, 'tt-fact-1');
+  assert.equal(payload.cameraHeadingDeg, 142);
+  assert.equal(payload.cameraCardinal, 'SE');
+  assert.ok(payload.shareText.includes('Terminal Tower'));
+  assert.ok(payload.shareText.includes('52 Stories Over the Cuyahoga Valley'));
+  assert.ok(payload.shareText.includes('Sightline 142° SE'));
+  assert.ok(payload.platformUrls.X_TWITTER.startsWith('https://twitter.com/intent/tweet?'));
+  assert.ok(payload.platformUrls.FACEBOOK.startsWith('https://www.facebook.com/sharer/sharer.php?'));
+  assert.ok(payload.platformUrls.LINKEDIN.startsWith('https://www.linkedin.com/sharing/share-offsite/?'));
+  assert.ok(payload.platformUrls.REDDIT.startsWith('https://www.reddit.com/submit?'));
+  assert.ok(payload.platformUrls.EMAIL.startsWith('mailto:?subject='));
+});
+
+
 
 
 

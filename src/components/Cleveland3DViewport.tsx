@@ -8,21 +8,33 @@ import {
   LandmarkBlueprint,
   SANDSTONE_TEXTURE_PATH,
 } from '../data/clevelandLandmarks';
-import { filterARFactsByEra } from '../utils/tourLogic';
+import {
+  GyroOrientationInput,
+  buildARDiscoverySharePayload,
+  computeGyroCompassAlignment,
+  computeLandmarkSightlineBearing,
+  filterARFactsByEra,
+} from '../utils/tourLogic';
 import {
   Camera,
+  Check,
   ChevronDown,
   ChevronUp,
   Compass,
+  Copy,
+  Download,
+  ExternalLink,
   Eye,
   Heart,
   Layers,
+  Navigation,
   RotateCcw,
   Share2,
   Sparkles,
   Volume2,
   VolumeX,
   Code2,
+  X,
 } from 'lucide-react';
 
 interface ProjectedFactNode {
@@ -190,6 +202,213 @@ export const Cleveland3DViewport: React.FC<Cleveland3DViewportProps> = ({
 
   const requestRenderRef = useRef<() => void>(() => {});
   const applyFinishModeRef = useRef<(mode: 'REALISTIC' | 'ARCHITECTURAL_CLAY' | 'BLUEPRINT') => void>(() => {});
+  const captureViewportSnapshotRef = useRef<() => string | null>(() => null);
+
+  // Direct AR Overlay Social Share State
+  const [arShareOverlayOpen, setArShareOverlayOpen] = useState<boolean>(false);
+  const [arShareTargetFact, setArShareTargetFact] =
+    useState<ARHistoricalFact | null>(null);
+  const [capturedViewDataUrl, setCapturedViewDataUrl] = useState<string | null>(
+    null
+  );
+  const [shareCopied, setShareCopied] = useState<boolean>(false);
+  const [shareStatusMessage, setShareStatusMessage] = useState<string | null>(
+    null
+  );
+
+  // 3D Gyroscope Orientation & Historical Sightline Alignment State
+  const [gyroOrientation, setGyroOrientation] = useState<GyroOrientationInput>({
+    alpha: 242, // Initial heading: (360 - 242) = 118° ESE (slightly off 142° SE Terminal Tower sightline)
+    beta: 58,
+    gamma: 0,
+    webkitCompassHeading: null,
+  });
+  const [gyroSource, setGyroSource] = useState<
+    'DEVICE_GYRO' | 'CAMERA_SYNC'
+  >('CAMERA_SYNC');
+  const hasHardwareGyroRef = useRef<boolean>(false);
+  const lastOrbitGyroSyncRef = useRef<number>(0);
+
+  const sightlineSpec = computeLandmarkSightlineBearing(selectedLandmark);
+  const compassAlignment = computeGyroCompassAlignment({
+    gyro: gyroOrientation,
+    targetBearingDeg: sightlineSpec.targetBearingDeg,
+    targetLandmarkTitle: sightlineSpec.targetTitle,
+  });
+
+  // Pivot 3D camera around the active landmark to match a compass heading (0..359°)
+  const syncCameraToCompassHeading = useCallback(
+    (headingDeg: number, lm: LandmarkBlueprint = selectedLandmarkRef.current) => {
+      const [lx, ly, lz] = lm.scenePosition3D;
+      const radius = arLensRef.current ? 22.8 : 26.4;
+      const heightOffset = arLensRef.current ? 11.5 : 13.5;
+      // Convert compass azimuth so targetBearingDeg places camera at canonical front view
+      const targetSight = computeLandmarkSightlineBearing(lm).targetBearingDeg;
+      const canonicalAngleRad = Math.atan2(16.0, 21.0); // ~37.3 deg canonical camera angle
+      const deltaRad = ((headingDeg - targetSight) * Math.PI) / 180;
+      const orbitAngle = canonicalAngleRad + deltaRad;
+
+      cameraTargetRef.current = {
+        pos: new THREE.Vector3(
+          lx + Math.sin(orbitAngle) * radius,
+          ly + heightOffset,
+          lz + Math.cos(orbitAngle) * radius
+        ),
+        lookAt: new THREE.Vector3(lx, ly + 5.2, lz),
+        active: true,
+      };
+      requestRenderRef.current();
+    },
+    []
+  );
+
+  // Listen to real W3C DeviceOrientation / Gyroscope events on window
+  useEffect(() => {
+    const handleDeviceOrientation = (event: DeviceOrientationEvent) => {
+      const webkitHeading = (event as any).webkitCompassHeading;
+      const hasValidAngles =
+        typeof event.alpha === 'number' ||
+        typeof event.beta === 'number' ||
+        typeof event.gamma === 'number' ||
+        typeof webkitHeading === 'number';
+
+      if (!hasValidAngles) return;
+
+      hasHardwareGyroRef.current = true;
+      setGyroSource('DEVICE_GYRO');
+      const nextGyro: GyroOrientationInput = {
+        alpha: typeof event.alpha === 'number' ? event.alpha : 0,
+        beta: typeof event.beta === 'number' ? event.beta : 55,
+        gamma: typeof event.gamma === 'number' ? event.gamma : 0,
+        webkitCompassHeading:
+          typeof webkitHeading === 'number' ? webkitHeading : null,
+      };
+      setGyroOrientation(nextGyro);
+
+      const resolvedHeading =
+        typeof webkitHeading === 'number'
+          ? webkitHeading
+          : typeof event.alpha === 'number'
+          ? (360 - (event.alpha % 360) + 360) % 360
+          : 0;
+      syncCameraToCompassHeading(resolvedHeading);
+    };
+
+    window.addEventListener('deviceorientation', handleDeviceOrientation, true);
+    window.addEventListener(
+      'deviceorientationabsolute' as any,
+      handleDeviceOrientation,
+      true
+    );
+    return () => {
+      window.removeEventListener(
+        'deviceorientation',
+        handleDeviceOrientation,
+        true
+      );
+      window.removeEventListener(
+        'deviceorientationabsolute' as any,
+        handleDeviceOrientation,
+        true
+      );
+    };
+  }, [syncCameraToCompassHeading]);
+
+  // Snap gyroscope compass needle and 3D camera directly onto the active landmark's historical sightline
+  const handleAlignCompassToSight = useCallback(async () => {
+    // Request iOS 13+ DeviceOrientation permission if available on device
+    try {
+      const DeviceOrientationEvt = (window as any).DeviceOrientationEvent;
+      if (
+        DeviceOrientationEvt &&
+        typeof DeviceOrientationEvt.requestPermission === 'function'
+      ) {
+        await DeviceOrientationEvt.requestPermission();
+      }
+    } catch {
+      // Fallback to calibrated alignment
+    }
+
+    const targetDeg = computeLandmarkSightlineBearing(
+      selectedLandmarkRef.current
+    ).targetBearingDeg;
+    const alignedAlpha = (360 - targetDeg) % 360;
+    setGyroOrientation((prev) => ({
+      ...prev,
+      alpha: alignedAlpha,
+      beta: 56,
+      gamma: 0,
+      webkitCompassHeading: null,
+    }));
+    syncCameraToCompassHeading(targetDeg, selectedLandmarkRef.current);
+  }, [syncCameraToCompassHeading]);
+
+  // Manual gyroscope heading scrubber (0..359°) for testing & fine alignment
+  const handleManualGyroHeadingChange = useCallback(
+    (newHeadingDeg: number) => {
+      const normalized = ((newHeadingDeg % 360) + 360) % 360;
+      const nextAlpha = (360 - normalized) % 360;
+      setGyroOrientation((prev) => ({
+        ...prev,
+        alpha: nextAlpha,
+        webkitCompassHeading: null,
+      }));
+      syncCameraToCompassHeading(normalized, selectedLandmarkRef.current);
+    },
+    [syncCameraToCompassHeading]
+  );
+
+  // Open direct AR overlay social media share modal with live 3D view capture
+  const handleOpenDirectARShare = useCallback(
+    (factToShare?: ARHistoricalFact | null) => {
+      const resolvedFact =
+        factToShare || selectedFact || selectedLandmark.arFacts[0] || null;
+      if (resolvedFact && resolvedFact.id !== selectedFact?.id) {
+        onSelectFact(resolvedFact);
+      }
+      setArShareTargetFact(resolvedFact);
+      const snap = captureViewportSnapshotRef.current();
+      setCapturedViewDataUrl(snap || selectedLandmark.heroImage);
+      setShareCopied(false);
+      setShareStatusMessage(null);
+      setArShareOverlayOpen(true);
+    },
+    [selectedFact, selectedLandmark, onSelectFact]
+  );
+
+  const activeSharePayload = buildARDiscoverySharePayload({
+    landmark: selectedLandmark,
+    fact: arShareTargetFact || selectedFact || selectedLandmark.arFacts[0],
+    cameraHeadingDeg: compassAlignment.deviceHeadingDeg,
+    baseUrl:
+      typeof window !== 'undefined' && window.location?.origin
+        ? window.location.origin
+        : 'https://clevetour3d.app',
+  });
+
+  const handleCopyARShareCaption = useCallback(async () => {
+    const fullCopy = `${activeSharePayload.shareText}\n${activeSharePayload.shareUrl}`;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(fullCopy);
+      }
+    } catch {
+      // Fallback if clipboard blocked in iframe
+    }
+    setShareCopied(true);
+    setShareStatusMessage('Discovery caption & 3D AR link copied to clipboard!');
+  }, [activeSharePayload]);
+
+  const handleDownloadARViewSnapshot = useCallback(() => {
+    const dataUri = capturedViewDataUrl || selectedLandmark.heroImage;
+    const link = document.createElement('a');
+    link.href = dataUri;
+    link.download = `clevetour-3d-${selectedLandmark.slug}-ar-view.png`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setShareStatusMessage('3D AR view snapshot saved to your device!');
+  }, [capturedViewDataUrl, selectedLandmark]);
 
   // Audio narration helper
   const toggleNarration = useCallback((landmark: LandmarkBlueprint, fact: ARHistoricalFact | null) => {
@@ -1070,12 +1289,47 @@ export const Cleveland3DViewport: React.FC<Cleveland3DViewportProps> = ({
     }
 
     requestRenderRef.current = requestRender;
+    captureViewportSnapshotRef.current = () => {
+      try {
+        renderer.render(scene, camera);
+        return renderer.domElement.toDataURL('image/png');
+      } catch {
+        return null;
+      }
+    };
 
     const handleControlStart = () => {
       cameraTargetRef.current.active = false;
     };
     const handleControlChange = () => {
       requestRender();
+      // Couple 3D camera orbit azimuth back to the 3D compass needle when user drags viewport
+      const now = performance.now();
+      if (!hasHardwareGyroRef.current && now - lastOrbitGyroSyncRef.current > 65) {
+        lastOrbitGyroSyncRef.current = now;
+        const dx = camera.position.x - controls.target.x;
+        const dz = camera.position.z - controls.target.z;
+        const dy = camera.position.y - controls.target.y;
+        const horizDist = Math.max(0.1, Math.hypot(dx, dz));
+        const orbitRad = Math.atan2(dx, dz);
+        const canonicalRad = Math.atan2(16.0, 21.0);
+        const activeSight = computeLandmarkSightlineBearing(
+          selectedLandmarkRef.current
+        ).targetBearingDeg;
+        const derivedHeading =
+          ((activeSight + ((orbitRad - canonicalRad) * 180) / Math.PI) % 360 +
+            360) %
+          360;
+        const derivedBeta = Math.round(
+          Math.max(25, Math.min(82, 75 - (Math.atan2(dy, horizDist) * 180) / Math.PI))
+        );
+        setGyroOrientation({
+          alpha: (360 - derivedHeading) % 360,
+          beta: derivedBeta,
+          gamma: 0,
+          webkitCompassHeading: null,
+        });
+      }
     };
     controls.addEventListener('start', handleControlStart);
     controls.addEventListener('change', handleControlChange);
@@ -1286,40 +1540,74 @@ export const Cleveland3DViewport: React.FC<Cleveland3DViewportProps> = ({
           </button>
         </div>
 
-        {/* Projected 3D Spatial AR Fact Overlays (Semantic DOM Nodes) */}
+        {/* Projected 3D Spatial AR Fact Overlays (Semantic DOM Nodes with Direct Share Action) */}
         {arLensActive && (
           <div className="absolute inset-0 pointer-events-none z-10">
-            {/* Subtle ViroReact Spatial Calibration Reticle */}
-            <div className="hidden md:block absolute top-20 right-4 bg-[#0f172ae6] border border-amber-500/40 rounded-lg px-3 py-1.5 text-[11px] font-mono text-amber-300">
-              ViroARScene · World Tracking Normal · Era ≤ {eraMaxYear}
+            {/* Subtle ViroReact Spatial Calibration Reticle + Direct Share AR View Button */}
+            <div className="hidden md:flex items-center gap-2 absolute top-20 right-4 bg-[#0f172ae6] border border-amber-500/40 rounded-lg px-3 py-1.5 text-[11px] font-mono text-amber-300 pointer-events-auto">
+              <span>ViroARScene · World Tracking Normal · Era ≤ {eraMaxYear}</span>
+              <button
+                type="button"
+                onClick={() => handleOpenDirectARShare(selectedFact)}
+                data-testid="ar-reticle-share-btn"
+                aria-label="Share current AR view and discovery fact"
+                className="ml-1 px-2 py-0.5 rounded bg-amber-500/20 hover:bg-amber-500 text-amber-300 hover:text-slate-950 border border-amber-500/50 text-[10px] font-semibold flex items-center gap-1 transition-colors cursor-pointer"
+              >
+                <Share2 className="w-3 h-3" />
+                <span>Share</span>
+              </button>
             </div>
 
             {projectedNodes.map(({ fact, x, y, visible }) =>
               visible ? (
-                <button
+                <div
                   key={fact.id}
-                  type="button"
-                  onClick={() => onSelectFact(fact)}
+                  data-testid={`ar-overlay-node-${fact.id}`}
                   style={{
                     transform: `translate3d(${x}px, ${y}px, 0) translate(-50%, -100%)`,
                   }}
-                  className={`pointer-events-auto absolute top-0 left-0 text-left max-w-[200px] sm:max-w-[230px] px-2.5 py-1.5 sm:px-3 sm:py-2 rounded-xl border transition-transform duration-150 shadow-xl ${
+                  className={`pointer-events-auto absolute top-0 left-0 flex items-stretch rounded-xl border transition-transform duration-150 shadow-xl overflow-hidden ${
                     selectedFact?.id === fact.id
                       ? 'bg-amber-500 text-slate-950 border-amber-300 scale-105'
                       : 'bg-[#0f172af2] text-slate-100 border-amber-500/50 hover:border-amber-400'
                   }`}
                 >
-                  <div
-                    className={`text-[10px] font-mono ${
-                      selectedFact?.id === fact.id ? 'text-slate-900 font-semibold' : 'text-amber-400'
+                  <button
+                    type="button"
+                    onClick={() => onSelectFact(fact)}
+                    className="text-left max-w-[180px] sm:max-w-[205px] px-2.5 py-1.5 sm:px-3 sm:py-2 cursor-pointer"
+                  >
+                    <div
+                      className={`text-[10px] font-mono ${
+                        selectedFact?.id === fact.id
+                          ? 'text-slate-900 font-semibold'
+                          : 'text-amber-400'
+                      }`}
+                    >
+                      {fact.eraLabel} · {fact.category}
+                    </div>
+                    <div className="text-xs font-bold leading-snug mt-0.5 truncate">
+                      {fact.title}
+                    </div>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleOpenDirectARShare(fact);
+                    }}
+                    data-testid={`ar-node-share-btn-${fact.id}`}
+                    aria-label={`Share ${fact.title} AR discovery`}
+                    title="Share this 3D AR view & discovery fact"
+                    className={`px-2 flex items-center justify-center border-l transition-colors cursor-pointer ${
+                      selectedFact?.id === fact.id
+                        ? 'border-amber-600/30 hover:bg-amber-600/20 text-slate-950'
+                        : 'border-slate-800 hover:bg-slate-800 text-amber-300'
                     }`}
                   >
-                    {fact.eraLabel} · {fact.category}
-                  </div>
-                  <div className="text-xs font-bold leading-snug mt-0.5 truncate">
-                    {fact.title}
-                  </div>
-                </button>
+                    <Share2 className="w-3.5 h-3.5" />
+                  </button>
+                </div>
               ) : null
             )}
           </div>
@@ -1357,17 +1645,220 @@ export const Cleveland3DViewport: React.FC<Cleveland3DViewportProps> = ({
               <button
                 type="button"
                 onClick={() => toggleNarration(selectedLandmark, selectedFact)}
-                className="flex-1 py-1.5 px-3 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-semibold text-xs transition-colors whitespace-nowrap"
+                className="flex-1 py-1.5 px-3 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-semibold text-xs transition-colors whitespace-nowrap cursor-pointer"
               >
                 {audioSpeaking ? 'Stop Narration' : 'Narrate Fact'}
               </button>
               <button
                 type="button"
-                onClick={() => onOpenShareModal(selectedLandmark, selectedFact)}
-                className="py-1.5 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium text-xs border border-slate-700 transition-colors whitespace-nowrap"
+                onClick={() => handleOpenDirectARShare(selectedFact)}
+                data-testid="ar-overlay-share-btn"
+                aria-label={`Share ${selectedFact.title} view and discovery fact`}
+                className="py-1.5 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-amber-300 hover:text-white font-semibold text-xs border border-amber-500/40 flex items-center gap-1.5 transition-colors whitespace-nowrap cursor-pointer"
               >
-                Share Fact
+                <Share2 className="w-3.5 h-3.5" />
+                <span>Share</span>
               </button>
+            </div>
+          </div>
+        )}
+
+        {/* Direct AR View & Historical Discovery Social Media Share Modal (Inside 3D Viewer) */}
+        {arShareOverlayOpen && (
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Share 3D AR View and Discovery Fact to Social Media"
+            data-testid="ar-direct-share-modal"
+            className="absolute inset-0 z-30 bg-slate-950/80 flex items-center justify-center p-3 sm:p-5 pointer-events-auto"
+          >
+            <div className="w-full max-w-lg bg-[#0f172a] border border-amber-500/60 rounded-2xl p-4 sm:p-5 shadow-2xl space-y-4 max-h-full overflow-y-auto">
+              {/* Modal Header */}
+              <div className="flex items-start justify-between gap-3 pb-3 border-b border-slate-800">
+                <div>
+                  <div className="text-[11px] font-mono text-amber-400 flex items-center gap-1.5">
+                    <Share2 className="w-3.5 h-3.5" />
+                    <span>
+                      3D AR View & Historical Discovery Social Share · Stop 0
+                      {selectedLandmark.walkingOrder}
+                    </span>
+                  </div>
+                  <h3 className="text-base font-bold text-white mt-0.5">
+                    Share {activeSharePayload.landmarkTitle} —{' '}
+                    {activeSharePayload.factTitle}
+                  </h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setArShareOverlayOpen(false)}
+                  data-testid="close-ar-direct-share-btn"
+                  aria-label="Close AR social share modal"
+                  className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              {/* Captured 3D Viewport Snapshot + AR Fact Telemetry Stamp */}
+              <div className="relative h-40 sm:h-44 rounded-xl overflow-hidden border border-slate-700 bg-slate-950">
+                <img
+                  src={capturedViewDataUrl || selectedLandmark.heroImage}
+                  alt={`3D AR View of ${activeSharePayload.landmarkTitle}`}
+                  data-testid="ar-share-view-snapshot"
+                  className="w-full h-full object-cover"
+                />
+                <div className="absolute inset-0 bg-gradient-to-t from-slate-950 via-slate-950/35 to-transparent" />
+                <div className="absolute top-2.5 left-2.5 bg-slate-950/90 border border-amber-500/40 rounded-lg px-2.5 py-1 text-[10px] font-mono text-amber-300">
+                  Live 3D AR View · Sightline {activeSharePayload.cameraHeadingDeg}°{' '}
+                  {activeSharePayload.cameraCardinal} · GPS{' '}
+                  {activeSharePayload.coordinatesLabel}
+                </div>
+                <div className="absolute bottom-2.5 left-2.5 right-2.5">
+                  <div className="text-[10px] font-mono text-sky-300">
+                    {activeSharePayload.factEraLabel} ·{' '}
+                    {activeSharePayload.factCategory}
+                  </div>
+                  <div className="text-sm font-bold text-white truncate">
+                    {activeSharePayload.landmarkTitle}:{' '}
+                    {activeSharePayload.factTitle}
+                  </div>
+                </div>
+              </div>
+
+              {/* Formatted Discovery Fact Social Caption */}
+              <div className="bg-slate-950 border border-slate-800 rounded-xl p-3 space-y-2">
+                <div className="flex items-center justify-between text-[11px] font-mono text-slate-400">
+                  <span>Ready-to-Post Discovery Caption</span>
+                  <span className="text-amber-400">
+                    #{activeSharePayload.hashtags.join(' #')}
+                  </span>
+                </div>
+                <p
+                  data-testid="ar-share-caption-text"
+                  className="text-xs text-slate-200 leading-relaxed select-all"
+                >
+                  {activeSharePayload.shareText}
+                </p>
+              </div>
+
+              {/* Direct Social Media Platform Intent Links */}
+              <div className="space-y-1.5">
+                <div className="text-[11px] font-mono text-slate-400">
+                  Share Directly to Social Media Platforms:
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                  <a
+                    href={activeSharePayload.platformUrls.X_TWITTER}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    data-testid="ar-share-platform-x"
+                    onClick={() =>
+                      setShareStatusMessage('Opened X (Twitter) share composer!')
+                    }
+                    className="py-2 px-3 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-xs font-semibold text-white flex items-center justify-center gap-1.5 transition-colors"
+                  >
+                    <span>X / Twitter</span>
+                    <ExternalLink className="w-3 h-3 text-amber-400" />
+                  </a>
+                  <a
+                    href={activeSharePayload.platformUrls.FACEBOOK}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    data-testid="ar-share-platform-facebook"
+                    onClick={() =>
+                      setShareStatusMessage('Opened Facebook share dialog!')
+                    }
+                    className="py-2 px-3 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-xs font-semibold text-white flex items-center justify-center gap-1.5 transition-colors"
+                  >
+                    <span>Facebook</span>
+                    <ExternalLink className="w-3 h-3 text-sky-400" />
+                  </a>
+                  <a
+                    href={activeSharePayload.platformUrls.LINKEDIN}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    data-testid="ar-share-platform-linkedin"
+                    onClick={() =>
+                      setShareStatusMessage('Opened LinkedIn share composer!')
+                    }
+                    className="py-2 px-3 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-xs font-semibold text-white flex items-center justify-center gap-1.5 transition-colors"
+                  >
+                    <span>LinkedIn</span>
+                    <ExternalLink className="w-3 h-3 text-sky-300" />
+                  </a>
+                  <a
+                    href={activeSharePayload.platformUrls.REDDIT}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    data-testid="ar-share-platform-reddit"
+                    onClick={() =>
+                      setShareStatusMessage('Opened Reddit post composer!')
+                    }
+                    className="py-2 px-3 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-xs font-semibold text-white flex items-center justify-center gap-1.5 transition-colors"
+                  >
+                    <span>Reddit</span>
+                    <ExternalLink className="w-3 h-3 text-amber-400" />
+                  </a>
+                </div>
+              </div>
+
+              {/* Instant Copy, Snapshot Download & Community Postcard Studio Actions */}
+              <div className="flex flex-wrap items-center gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={handleCopyARShareCaption}
+                  data-testid="ar-share-copy-btn"
+                  className="flex-1 py-2 px-3 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-semibold text-xs flex items-center justify-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap"
+                >
+                  {shareCopied ? (
+                    <>
+                      <Check className="w-3.5 h-3.5" />
+                      <span>Copied to Clipboard!</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5" />
+                      <span>Copy Share Text & Link</span>
+                    </>
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleDownloadARViewSnapshot}
+                  data-testid="ar-share-download-snapshot-btn"
+                  className="py-2 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-medium text-xs flex items-center justify-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap"
+                >
+                  <Download className="w-3.5 h-3.5 text-sky-400" />
+                  <span>Save 3D Snapshot</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setArShareOverlayOpen(false);
+                    onOpenShareModal(
+                      selectedLandmark,
+                      arShareTargetFact || selectedFact
+                    );
+                  }}
+                  data-testid="ar-share-open-passport-btn"
+                  className="py-2 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-amber-300 border border-amber-500/40 font-medium text-xs flex items-center justify-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap"
+                >
+                  <Sparkles className="w-3.5 h-3.5" />
+                  <span>Postcard Studio</span>
+                </button>
+              </div>
+
+              {shareStatusMessage && (
+                <div
+                  role="status"
+                  data-testid="ar-share-status-banner"
+                  className="text-xs font-mono text-emerald-300 bg-emerald-500/15 border border-emerald-500/40 rounded-xl px-3 py-2"
+                >
+                  {shareStatusMessage}
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -1377,6 +1868,213 @@ export const Cleveland3DViewport: React.FC<Cleveland3DViewportProps> = ({
             {cameraError}
           </div>
         )}
+
+        {/* 3D Gyroscope Compass Needle & Historical Sightline Alignment Overlay */}
+        <div
+          role="region"
+          aria-label="3D Gyroscope Compass Needle and Historical Sightline Overlay"
+          data-testid="gyro-compass-overlay"
+          className="hidden sm:block absolute bottom-28 left-4 z-20 w-[268px] bg-[#0f172af2] border border-slate-700/90 rounded-2xl p-3 shadow-2xl pointer-events-auto"
+        >
+          {/* Header: Gyro Sensor Mode & Sightline Lock Status */}
+          <div className="flex items-center justify-between gap-2 pb-2 border-b border-slate-800">
+            <div className="flex items-center gap-1.5 text-[11px] font-mono text-amber-400 font-semibold">
+              <Navigation className="w-3.5 h-3.5 text-amber-400" />
+              <span>
+                {gyroSource === 'DEVICE_GYRO'
+                  ? '3D Gyro Sensor Live'
+                  : '3D Gyro Compass'}
+              </span>
+            </div>
+            <span
+              data-testid="gyro-alignment-status"
+              className={`px-2 py-0.5 rounded-md text-[10px] font-mono font-semibold border ${
+                compassAlignment.isAligned
+                  ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-300'
+                  : 'bg-amber-500/15 border-amber-500/40 text-amber-300'
+              }`}
+            >
+              {compassAlignment.isAligned
+                ? 'SIGHTLINE LOCKED'
+                : `${compassAlignment.relativeNeedleAngleDeg > 0 ? '+' : ''}${
+                    compassAlignment.relativeNeedleAngleDeg
+                  }° DELTA`}
+            </span>
+          </div>
+
+          {/* Middle Row: 3D Perspective Tilted Compass Dial & Needle + Telemetry */}
+          <div className="flex items-center gap-3 py-2.5">
+            {/* 3D Perspective Gimbal Housing */}
+            <div
+              className="relative w-20 h-20 shrink-0 flex items-center justify-center"
+              style={{ perspective: '340px' }}
+            >
+              <div
+                data-testid="gyro-compass-needle-3d"
+                data-heading-deg={compassAlignment.deviceHeadingDeg}
+                data-relative-angle-deg={compassAlignment.relativeNeedleAngleDeg}
+                data-aligned={String(compassAlignment.isAligned)}
+                className={`relative w-[76px] h-[76px] rounded-full border-2 transition-transform duration-150 ease-out flex items-center justify-center shadow-inner ${
+                  compassAlignment.isAligned
+                    ? 'bg-slate-950 border-emerald-400/80 shadow-emerald-500/20'
+                    : 'bg-slate-950 border-amber-500/60'
+                }`}
+                style={{
+                  transform: `rotateX(${compassAlignment.pitchTiltDeg}deg) rotateY(${compassAlignment.rollTiltDeg}deg)`,
+                  transformStyle: 'preserve-3d',
+                }}
+              >
+                {/* Rotating 360° Cardinal Azimuth Ring (North relative to phone) */}
+                <div
+                  data-testid="gyro-cardinal-ring"
+                  className="absolute inset-0 transition-transform duration-150 ease-out"
+                  style={{
+                    transform: `rotateZ(${compassAlignment.northNeedleAngleDeg}deg)`,
+                  }}
+                >
+                  <span className="absolute top-1 left-1/2 -translate-x-1/2 text-[9px] font-mono font-extrabold text-rose-400">
+                    N
+                  </span>
+                  <span className="absolute right-1.5 top-1/2 -translate-y-1/2 text-[8px] font-mono font-bold text-slate-400">
+                    E
+                  </span>
+                  <span className="absolute bottom-1 left-1/2 -translate-x-1/2 text-[8px] font-mono font-bold text-slate-400">
+                    S
+                  </span>
+                  <span className="absolute left-1.5 top-1/2 -translate-y-1/2 text-[8px] font-mono font-bold text-slate-400">
+                    W
+                  </span>
+                </div>
+
+                {/* Inner Elevation Concentric Reticle Ring */}
+                <div className="w-11 h-11 rounded-full border border-dashed border-slate-700/90" />
+
+                {/* 3D Faceted Historical Sightline Pointer Needle */}
+                <div
+                  data-testid="gyro-sightline-needle"
+                  className="absolute inset-0 flex items-center justify-center transition-transform duration-150 ease-out"
+                  style={{
+                    transform: `rotateZ(${compassAlignment.relativeNeedleAngleDeg}deg) translateZ(6px)`,
+                  }}
+                >
+                  <svg
+                    viewBox="0 0 64 64"
+                    className="w-14 h-14 overflow-visible"
+                    aria-hidden="true"
+                  >
+                    {/* North/Sightline Forward Faceted Spear (Emerald when aligned, Amber when seeking) */}
+                    <polygon
+                      points="32,6 26,32 32,28"
+                      fill={compassAlignment.isAligned ? '#34d399' : '#fbbf24'}
+                    />
+                    <polygon
+                      points="32,6 38,32 32,28"
+                      fill={compassAlignment.isAligned ? '#10b981' : '#d97706'}
+                    />
+                    {/* Tail Counterweight Faceted Fin */}
+                    <polygon points="32,56 27,32 32,35" fill="#475569" />
+                    <polygon points="32,56 37,32 32,35" fill="#334155" />
+                    {/* Center Brass Gimbal Pivot */}
+                    <circle
+                      cx="32"
+                      cy="32"
+                      r="3.8"
+                      fill="#f8fafc"
+                      stroke="#0f172a"
+                      strokeWidth="1.5"
+                    />
+                  </svg>
+                </div>
+              </div>
+            </div>
+
+            {/* Right Column: Live Azimuth & Sightline Guidance */}
+            <div className="min-w-0 flex-1 space-y-1">
+              <div className="flex items-baseline justify-between">
+                <span className="text-[10px] font-mono text-slate-400">
+                  Phone Heading
+                </span>
+                <span
+                  data-testid="gyro-device-heading"
+                  className="text-sm font-mono font-bold text-white"
+                >
+                  {compassAlignment.deviceHeadingDeg}° {compassAlignment.deviceCardinal}
+                </span>
+              </div>
+
+              <div className="flex items-baseline justify-between">
+                <span className="text-[10px] font-mono text-slate-400">
+                  Sight Bearing
+                </span>
+                <span
+                  data-testid="gyro-target-bearing"
+                  className="text-xs font-mono font-semibold text-amber-300"
+                >
+                  {compassAlignment.targetBearingDeg}° {compassAlignment.targetCardinal}
+                </span>
+              </div>
+
+              <div
+                data-testid="gyro-tilt-telemetry"
+                className="text-[10px] font-mono text-sky-300 truncate"
+              >
+                Tilt β {compassAlignment.pitchTiltDeg}° · Roll γ{' '}
+                {compassAlignment.rollTiltDeg}°
+              </div>
+
+              <p
+                data-testid="gyro-alignment-instruction"
+                className="text-[10px] text-slate-300 leading-snug line-clamp-2 pt-0.5"
+              >
+                {compassAlignment.alignmentInstruction}
+              </p>
+            </div>
+          </div>
+
+          {/* Bottom Controls: Gyro Heading Scrubber & Snap-to-Sightline Button */}
+          <div className="pt-2 border-t border-slate-800 space-y-2">
+            <div className="flex items-center gap-2">
+              <label
+                htmlFor="gyro-heading-slider"
+                className="text-[10px] font-mono text-slate-400 whitespace-nowrap"
+              >
+                Gyro Yaw:
+              </label>
+              <input
+                id="gyro-heading-slider"
+                data-testid="gyro-heading-slider"
+                type="range"
+                min={0}
+                max={359}
+                step={1}
+                value={compassAlignment.deviceHeadingDeg}
+                onChange={(e) =>
+                  handleManualGyroHeadingChange(Number(e.target.value))
+                }
+                aria-label="Simulate device gyroscope compass heading"
+                className="w-full accent-amber-500 cursor-pointer h-1.5"
+              />
+            </div>
+
+            <button
+              type="button"
+              onClick={handleAlignCompassToSight}
+              data-testid="align-compass-to-sight-btn"
+              className={`w-full py-1.5 px-2.5 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer ${
+                compassAlignment.isAligned
+                  ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/50'
+                  : 'bg-amber-500 hover:bg-amber-400 text-slate-950'
+              }`}
+            >
+              <Compass className="w-3.5 h-3.5" />
+              <span>
+                {compassAlignment.isAligned
+                  ? `Aligned with ${selectedLandmark.shortTitle}`
+                  : `Align Phone with ${selectedLandmark.shortTitle}`}
+              </span>
+            </button>
+          </div>
+        </div>
 
       {/* Unified Collapsible Bottom Control Dock (Zero Viewport Occlusion) */}
       <div
@@ -1585,10 +2283,12 @@ export const Cleveland3DViewport: React.FC<Cleveland3DViewportProps> = ({
             </button>
             <button
               type="button"
-              onClick={() => onOpenShareModal(selectedLandmark, selectedFact)}
-              className="py-2 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium text-xs border border-slate-700 transition-colors whitespace-nowrap"
+              onClick={() => handleOpenDirectARShare(selectedFact)}
+              data-testid="ar-overlay-mobile-share-btn"
+              className="py-2 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-amber-300 font-semibold text-xs border border-amber-500/40 flex items-center gap-1.5 transition-colors whitespace-nowrap cursor-pointer"
             >
-              Share Fact
+              <Share2 className="w-3.5 h-3.5" />
+              <span>Share</span>
             </button>
           </div>
         </div>
