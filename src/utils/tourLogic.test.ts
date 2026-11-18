@@ -17,6 +17,8 @@ import {
   describeWmoWeatherCode,
   evaluateWalkingPreparationAdvisory,
   parseOpenMeteoForecastResponse,
+  buildHapticFeedbackPulse,
+  triggerDeviceHapticFeedback,
 } from './tourLogic';
 import {
   CLEVELAND_LANDMARKS,
@@ -301,6 +303,76 @@ test('parseOpenMeteoForecastResponse normalizes Open-Meteo JSON into ClevelandWe
   assert.equal(parsed.hourlyForecast[1].hourLabel, '12 PM');
   assert.equal(parsed.precipitationProbabilityPercent, 15);
 });
+
+test('buildHapticFeedbackPulse and triggerDeviceHapticFeedback generate distinct Vibration API patterns for landmark arrival, badge unlock, and proximity alerts', () => {
+  const recordedPatterns: Array<number | number[]> = [];
+  const mockVibrate = (pattern: number | number[]) => {
+    recordedPatterns.push(pattern);
+    return true;
+  };
+
+  // 1. Landmark Arrival pulse ([35, 45, 55])
+  const arrivalPulse = buildHapticFeedbackPulse(
+    'LANDMARK_ARRIVAL',
+    'The Arcade Cleveland',
+    '2026-11-18T12:00:00Z'
+  );
+  assert.deepEqual(arrivalPulse.patternMs, [35, 45, 55]);
+  assert.equal(arrivalPulse.totalDurationMs, 135);
+  assert.equal(arrivalPulse.label, 'Landmark Arrival Pulse');
+  assert.equal(arrivalPulse.patternNotation, '35ms · 45ms gap · 55ms');
+
+  const arrivalResult = triggerDeviceHapticFeedback(
+    arrivalPulse,
+    true,
+    mockVibrate
+  );
+  assert.equal(arrivalResult.didVibrate, true);
+  assert.equal(arrivalResult.apiSupported, true);
+  assert.deepEqual(recordedPatterns[0], [35, 45, 55]);
+
+  // 2. Passport Badge Unlocked pulse ([50, 40, 50, 40, 110])
+  const badgePulse = buildHapticFeedbackPulse(
+    'BADGE_UNLOCKED',
+    'Public Square Pioneer',
+    '2026-11-18T12:01:00Z'
+  );
+  assert.deepEqual(badgePulse.patternMs, [50, 40, 50, 40, 110]);
+  assert.equal(badgePulse.totalDurationMs, 290);
+  const badgeResult = triggerDeviceHapticFeedback(
+    badgePulse,
+    true,
+    mockVibrate
+  );
+  assert.equal(badgeResult.didVibrate, true);
+  assert.deepEqual(recordedPatterns[1], [50, 40, 50, 40, 110]);
+
+  // 3. Proximity Geofence Notification pulse ([25, 35, 25])
+  const proximityPulse = buildHapticFeedbackPulse(
+    'PROXIMITY_NOTIFICATION',
+    'Rock & Roll Hall of Fame (45m)',
+    '2026-11-18T12:02:00Z'
+  );
+  assert.deepEqual(proximityPulse.patternMs, [25, 35, 25]);
+  assert.equal(proximityPulse.totalDurationMs, 85);
+  const proximityResult = triggerDeviceHapticFeedback(
+    proximityPulse,
+    true,
+    mockVibrate
+  );
+  assert.equal(proximityResult.didVibrate, true);
+  assert.deepEqual(recordedPatterns[2], [25, 35, 25]);
+
+  // 4. Disabled haptics suppresses navigator.vibrate call
+  const mutedResult = triggerDeviceHapticFeedback(
+    arrivalPulse,
+    false,
+    mockVibrate
+  );
+  assert.equal(mutedResult.didVibrate, false);
+  assert.equal(recordedPatterns.length, 3);
+});
+
 
 
 

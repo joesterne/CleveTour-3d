@@ -915,5 +915,115 @@ export function parseOpenMeteoForecastResponse(
   };
 }
 
+export type HapticEventType =
+  | 'LANDMARK_ARRIVAL'
+  | 'BADGE_UNLOCKED'
+  | 'PROXIMITY_NOTIFICATION';
+
+export interface HapticFeedbackPulse {
+  eventType: HapticEventType;
+  patternMs: number[];
+  totalDurationMs: number;
+  label: string;
+  contextTitle: string;
+  patternNotation: string;
+  triggeredAtIso: string;
+}
+
+const HAPTIC_PATTERNS: Record<
+  HapticEventType,
+  { patternMs: number[]; label: string }
+> = {
+  LANDMARK_ARRIVAL: {
+    // Subtle crisp two-step footstep arrival pulse (35ms buzz, 45ms pause, 55ms buzz)
+    patternMs: [35, 45, 55],
+    label: 'Landmark Arrival Pulse',
+  },
+  BADGE_UNLOCKED: {
+    // Celebratory triple-crest passport stamp fanfare (50ms, 40ms pause, 50ms, 40ms pause, 110ms)
+    patternMs: [50, 40, 50, 40, 110],
+    label: 'Passport Badge Unlocked Haptic',
+  },
+  PROXIMITY_NOTIFICATION: {
+    // Gentle double-tap geofence alert (25ms buzz, 35ms pause, 25ms buzz)
+    patternMs: [25, 35, 25],
+    label: 'Proximity Geofence Double-Tap',
+  },
+};
+
+/**
+ * Builds a structured Web Vibration API haptic pulse specification for a tour milestone event.
+ */
+export function buildHapticFeedbackPulse(
+  eventType: HapticEventType,
+  contextTitle: string,
+  nowIso: string = new Date().toISOString()
+): HapticFeedbackPulse {
+  const spec = HAPTIC_PATTERNS[eventType];
+  const patternMs = [...spec.patternMs];
+  const totalDurationMs = patternMs.reduce((sum, ms) => sum + ms, 0);
+  const patternNotation = patternMs
+    .map((ms, idx) => (idx % 2 === 0 ? `${ms}ms` : `${ms}ms gap`))
+    .join(' · ');
+
+  return {
+    eventType,
+    patternMs,
+    totalDurationMs,
+    label: spec.label,
+    contextTitle,
+    patternNotation,
+    triggeredAtIso: nowIso,
+  };
+}
+
+/**
+ * Executes a haptic feedback pulse via the Web Vibration API (`navigator.vibrate`)
+ * when enabled, returning deterministic execution metadata for UI feedback and testing.
+ */
+export function triggerDeviceHapticFeedback(
+  pulse: HapticFeedbackPulse,
+  enabled: boolean = true,
+  customVibrateFn?: ((pattern: number | number[]) => boolean) | null
+): {
+  didVibrate: boolean;
+  apiSupported: boolean;
+  pulse: HapticFeedbackPulse;
+} {
+  const vibrateFn =
+    customVibrateFn !== undefined
+      ? customVibrateFn
+      : typeof navigator !== 'undefined' &&
+        typeof navigator.vibrate === 'function'
+      ? navigator.vibrate.bind(navigator)
+      : null;
+
+  const apiSupported = typeof vibrateFn === 'function';
+
+  if (!enabled) {
+    return {
+      didVibrate: false,
+      apiSupported,
+      pulse,
+    };
+  }
+
+  let didVibrate = false;
+  if (apiSupported && vibrateFn) {
+    try {
+      didVibrate = Boolean(vibrateFn(pulse.patternMs));
+    } catch {
+      didVibrate = false;
+    }
+  }
+
+  return {
+    didVibrate,
+    apiSupported,
+    pulse,
+  };
+}
+
+
 
 

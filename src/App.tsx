@@ -10,8 +10,11 @@ import {
 } from './data/clevelandLandmarks';
 import {
   GeoPoint,
+  HapticEventType,
+  HapticFeedbackPulse,
   LandmarkNarrationPayload,
   ProximityNotification,
+  buildHapticFeedbackPulse,
   buildLandmarkNarrationScript,
   calculateCompassBearing,
   calculateHaversineDistanceMeters,
@@ -21,6 +24,7 @@ import {
   evaluatePassportBadges,
   evaluateProximityGeofences,
   interpolateTrailPosition,
+  triggerDeviceHapticFeedback,
 } from './utils/tourLogic';
 import { Cleveland3DViewport } from './components/Cleveland3DViewport';
 import {
@@ -34,6 +38,7 @@ import {
 } from './components/TouristProfileAndShare';
 import { ClevelandWeatherWidget } from './components/ClevelandWeatherWidget';
 import {
+  Activity,
   Award,
   Bell,
   BellRing,
@@ -44,6 +49,7 @@ import {
   MapPin,
   Navigation,
   Share2,
+  Smartphone,
   Sparkles,
   Star,
   User,
@@ -234,6 +240,52 @@ export default function App() {
   const [newlyUnlockedBadgeBanner, setNewlyUnlockedBadgeBanner] =
     useState<PassportBadgeDefinition | null>(null);
 
+  // Web Vibration API Haptic Feedback State & Trigger Helper
+  const [hapticsEnabled, setHapticsEnabled] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem('clevetour_haptics_enabled');
+      return saved !== null ? JSON.parse(saved) : true;
+    } catch {
+      return true;
+    }
+  });
+
+  const [lastHapticPulse, setLastHapticPulse] =
+    useState<HapticFeedbackPulse | null>(() =>
+      buildHapticFeedbackPulse(
+        'LANDMARK_ARRIVAL',
+        CLEVELAND_LANDMARKS[0].shortTitle
+      )
+    );
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        'clevetour_haptics_enabled',
+        JSON.stringify(hapticsEnabled)
+      );
+    } catch {
+      // ignore storage quota errors
+    }
+  }, [hapticsEnabled]);
+
+  const fireTourHaptic = useCallback(
+    (
+      eventType: HapticEventType,
+      contextTitle: string,
+      overrideEnabled?: boolean
+    ) => {
+      const isEnabled = overrideEnabled ?? hapticsEnabled;
+      const pulse = buildHapticFeedbackPulse(eventType, contextTitle);
+      triggerDeviceHapticFeedback(pulse, isEnabled);
+      if (isEnabled) {
+        setLastHapticPulse(pulse);
+      }
+      return pulse;
+    },
+    [hapticsEnabled]
+  );
+
   // Evaluate proximity geofence whenever walkerPosition updates
   useEffect(() => {
     const newAlerts = evaluateProximityGeofences(
@@ -252,6 +304,12 @@ export default function App() {
       setActivePushBanner(topAlert);
       setNotificationHistory((prev) => [...newAlerts, ...prev]);
 
+      // Trigger subtle proximity notification haptic feedback ([25, 35, 25] ms)
+      fireTourHaptic(
+        'PROXIMITY_NOTIFICATION',
+        `${topAlert.landmarkTitle} (${topAlert.distanceMeters}m away)`
+      );
+
       // Automatically stamp visited passport when entering landmark geofence & check for district sticker unlock
       setVisitedIds((prev) => {
         if (prev.includes(topAlert.landmarkId)) return prev;
@@ -263,7 +321,9 @@ export default function App() {
           CLEVELAND_PASSPORT_BADGES
         );
         if (unlocked.length > 0) {
-          setNewlyUnlockedBadgeBanner(unlocked[unlocked.length - 1]);
+          const newestBadge = unlocked[unlocked.length - 1];
+          setNewlyUnlockedBadgeBanner(newestBadge);
+          fireTourHaptic('BADGE_UNLOCKED', newestBadge.stickerTitle);
         }
         return nextVisited;
       });
@@ -285,28 +345,35 @@ export default function App() {
         }
       }
     }
-  }, [walkerPosition, notifiedLandmarkIds]);
+  }, [walkerPosition, notifiedLandmarkIds, fireTourHaptic]);
 
   // Step walker to next landmark along the Cleveland walking trail
   const handleAdvanceWalkStep = useCallback(() => {
-    const nextIdx = ( Math.round(trailProgress) + 1 ) % CLEVELAND_LANDMARKS.length;
+    const nextIdx = (Math.round(trailProgress) + 1) % CLEVELAND_LANDMARKS.length;
     const nextLm = CLEVELAND_LANDMARKS[nextIdx];
     setTrailProgress(nextIdx);
     setWalkerPosition(nextLm.tourAnchor);
     setSelectedLandmark(nextLm);
     setSelectedFact(nextLm.arFacts[0] || null);
+    // Trigger subtle landmark arrival haptic pulse ([35, 45, 55] ms)
+    fireTourHaptic('LANDMARK_ARRIVAL', nextLm.shortTitle);
     // Allow re-triggering proximity alert if stepping intentionally
     setNotifiedLandmarkIds((prev) => prev.filter((id) => id !== nextLm.id));
-  }, [trailProgress]);
+  }, [trailProgress, fireTourHaptic]);
 
-  const handleStepWalkerToLandmark = useCallback((lm: LandmarkBlueprint) => {
-    const idx = CLEVELAND_LANDMARKS.findIndex((item) => item.id === lm.id);
-    if (idx >= 0) setTrailProgress(idx);
-    setWalkerPosition(lm.tourAnchor);
-    setSelectedLandmark(lm);
-    setSelectedFact(lm.arFacts[0] || null);
-    setNotifiedLandmarkIds((prev) => prev.filter((id) => id !== lm.id));
-  }, []);
+  const handleStepWalkerToLandmark = useCallback(
+    (lm: LandmarkBlueprint) => {
+      const idx = CLEVELAND_LANDMARKS.findIndex((item) => item.id === lm.id);
+      if (idx >= 0) setTrailProgress(idx);
+      setWalkerPosition(lm.tourAnchor);
+      setSelectedLandmark(lm);
+      setSelectedFact(lm.arFacts[0] || null);
+      // Trigger subtle landmark arrival haptic pulse ([35, 45, 55] ms)
+      fireTourHaptic('LANDMARK_ARRIVAL', lm.shortTitle);
+      setNotifiedLandmarkIds((prev) => prev.filter((id) => id !== lm.id));
+    },
+    [fireTourHaptic]
+  );
 
   const handleTrailSliderChange = (val: number) => {
     setTrailProgress(val);
@@ -318,6 +385,7 @@ export default function App() {
     if (nearest && nearest.id !== selectedLandmark.id) {
       setSelectedLandmark(nearest);
       setSelectedFact(nearest.arFacts[0] || null);
+      fireTourHaptic('LANDMARK_ARRIVAL', nearest.shortTitle);
     }
   };
 
@@ -345,39 +413,55 @@ export default function App() {
     );
   }, []);
 
-  const toggleVisited = useCallback((landmarkId: string) => {
-    setVisitedIds((prev) => {
-      const nextVisited = prev.includes(landmarkId)
-        ? prev.filter((id) => id !== landmarkId)
-        : [...prev, landmarkId];
-      const unlocked = detectNewlyUnlockedBadges(
-        prev,
-        nextVisited,
-        CLEVELAND_LANDMARKS,
-        CLEVELAND_PASSPORT_BADGES
-      );
-      if (unlocked.length > 0) {
-        setNewlyUnlockedBadgeBanner(unlocked[unlocked.length - 1]);
-      }
-      return nextVisited;
-    });
-  }, []);
+  const toggleVisited = useCallback(
+    (landmarkId: string) => {
+      setVisitedIds((prev) => {
+        const isAdding = !prev.includes(landmarkId);
+        const nextVisited = isAdding
+          ? [...prev, landmarkId]
+          : prev.filter((id) => id !== landmarkId);
+        const unlocked = detectNewlyUnlockedBadges(
+          prev,
+          nextVisited,
+          CLEVELAND_LANDMARKS,
+          CLEVELAND_PASSPORT_BADGES
+        );
+        if (unlocked.length > 0) {
+          const newestBadge = unlocked[unlocked.length - 1];
+          setNewlyUnlockedBadgeBanner(newestBadge);
+          fireTourHaptic('BADGE_UNLOCKED', newestBadge.stickerTitle);
+        } else if (isAdding) {
+          const lm = CLEVELAND_LANDMARKS.find((l) => l.id === landmarkId);
+          if (lm) {
+            fireTourHaptic('LANDMARK_ARRIVAL', lm.shortTitle);
+          }
+        }
+        return nextVisited;
+      });
+    },
+    [fireTourHaptic]
+  );
 
-  const handleStampMultipleVisited = useCallback((landmarkIds: string[]) => {
-    setVisitedIds((prev) => {
-      const merged = Array.from(new Set([...prev, ...landmarkIds]));
-      const unlocked = detectNewlyUnlockedBadges(
-        prev,
-        merged,
-        CLEVELAND_LANDMARKS,
-        CLEVELAND_PASSPORT_BADGES
-      );
-      if (unlocked.length > 0) {
-        setNewlyUnlockedBadgeBanner(unlocked[unlocked.length - 1]);
-      }
-      return merged;
-    });
-  }, []);
+  const handleStampMultipleVisited = useCallback(
+    (landmarkIds: string[]) => {
+      setVisitedIds((prev) => {
+        const merged = Array.from(new Set([...prev, ...landmarkIds]));
+        const unlocked = detectNewlyUnlockedBadges(
+          prev,
+          merged,
+          CLEVELAND_LANDMARKS,
+          CLEVELAND_PASSPORT_BADGES
+        );
+        if (unlocked.length > 0) {
+          const newestBadge = unlocked[unlocked.length - 1];
+          setNewlyUnlockedBadgeBanner(newestBadge);
+          fireTourHaptic('BADGE_UNLOCKED', newestBadge.stickerTitle);
+        }
+        return merged;
+      });
+    },
+    [fireTourHaptic]
+  );
 
   const handleResetVisited = useCallback(() => {
     setVisitedIds(['terminal-tower']);
@@ -592,8 +676,15 @@ export default function App() {
                 <Award className="w-5 h-5" />
               </div>
               <div>
-                <div className="text-xs font-mono text-emerald-400">
-                  Passport Badge Unlocked · {newlyUnlockedBadgeBanner.serialCode} · {newlyUnlockedBadgeBanner.districtName}
+                <div className="text-xs font-mono text-emerald-400 flex flex-wrap items-center gap-2">
+                  <span>
+                    Passport Badge Unlocked · {newlyUnlockedBadgeBanner.serialCode} · {newlyUnlockedBadgeBanner.districtName}
+                  </span>
+                  {hapticsEnabled && (
+                    <span className="px-2 py-0.5 rounded-md bg-emerald-500/15 border border-emerald-500/30 text-[10px] text-emerald-300">
+                      Haptic Fanfare: 50ms · 40ms gap · 50ms · 40ms gap · 110ms
+                    </span>
+                  )}
                 </div>
                 <div className="text-sm font-bold text-white mt-0.5">
                   Digital Achievement Sticker Earned: {newlyUnlockedBadgeBanner.stickerTitle}
@@ -643,8 +734,15 @@ export default function App() {
                 <BellRing className="w-5 h-5" />
               </div>
               <div>
-                <div className="text-xs font-mono text-amber-400">
-                  Location Alert · {activePushBanner.distanceMeters}m Away · Geofence Triggered
+                <div className="text-xs font-mono text-amber-400 flex flex-wrap items-center gap-2">
+                  <span>
+                    Location Alert · {activePushBanner.distanceMeters}m Away · Geofence Triggered
+                  </span>
+                  {hapticsEnabled && (
+                    <span className="px-2 py-0.5 rounded-md bg-amber-500/15 border border-amber-500/30 text-[10px] text-amber-300">
+                      Haptic Pulse: 25ms · 35ms gap · 25ms
+                    </span>
+                  )}
                 </div>
                 <div className="text-sm font-bold text-white mt-0.5">
                   Approaching {activePushBanner.landmarkTitle}: {activePushBanner.headlineFact.title}
@@ -868,8 +966,94 @@ export default function App() {
               >
                 {offlineMode ? 'Offline Mode: ON' : 'Offline Mode: OFF'}
               </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const next = !hapticsEnabled;
+                  setHapticsEnabled(next);
+                  if (next) {
+                    fireTourHaptic(
+                      'LANDMARK_ARRIVAL',
+                      selectedLandmark.shortTitle,
+                      true
+                    );
+                  }
+                }}
+                aria-pressed={hapticsEnabled}
+                data-testid="toggle-haptics-btn"
+                className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors flex items-center gap-1.5 whitespace-nowrap cursor-pointer ${
+                  hapticsEnabled
+                    ? 'bg-amber-500/15 border-amber-500/40 text-amber-300'
+                    : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-white'
+                }`}
+              >
+                <Smartphone className="w-3.5 h-3.5" />
+                <span>{hapticsEnabled ? 'Haptics: ON' : 'Haptics: OFF'}</span>
+              </button>
             </div>
           </div>
+
+          {/* Web Vibration API Tactile Haptic Feedback Telemetry Strip */}
+          {lastHapticPulse && (
+            <div
+              className="pt-2.5 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-2 text-xs font-mono"
+              data-testid="active-haptic-pulse-indicator"
+            >
+              <div className="flex flex-wrap items-center gap-2 text-slate-300">
+                <span
+                  className={`flex items-center gap-1.5 font-semibold ${
+                    hapticsEnabled ? 'text-amber-400' : 'text-slate-500'
+                  }`}
+                >
+                  <Activity className="w-3.5 h-3.5" />
+                  <span>
+                    {hapticsEnabled
+                      ? 'Web Vibration API Haptic Active:'
+                      : 'Web Vibration API Haptics Muted:'}
+                  </span>
+                </span>
+                <span
+                  className="text-white font-semibold"
+                  data-testid="haptic-pulse-label"
+                >
+                  {lastHapticPulse.label}
+                </span>
+                <span aria-hidden="true" className="text-slate-600">
+                  ·
+                </span>
+                <span
+                  className="text-sky-300"
+                  data-testid="haptic-pulse-context"
+                >
+                  {lastHapticPulse.contextTitle}
+                </span>
+                <span aria-hidden="true" className="text-slate-600">
+                  ·
+                </span>
+                <span
+                  className="px-2 py-0.5 rounded-md bg-slate-950 border border-slate-800 text-[11px] text-amber-300"
+                  data-testid="haptic-pulse-pattern"
+                >
+                  Pattern: [{lastHapticPulse.patternNotation}] ({lastHapticPulse.totalDurationMs}ms)
+                </span>
+              </div>
+
+              <button
+                type="button"
+                onClick={() =>
+                  fireTourHaptic(
+                    'LANDMARK_ARRIVAL',
+                    selectedLandmark.shortTitle
+                  )
+                }
+                disabled={!hapticsEnabled}
+                data-testid="test-haptic-pulse-btn"
+                className="text-[11px] font-mono text-amber-400 hover:text-amber-300 disabled:text-slate-600 underline cursor-pointer shrink-0"
+              >
+                Test Tactile Pulse
+              </button>
+            </div>
+          )}
 
           {/* Above-the-Fold Live Google Maps Places API (New) Grounding Strip */}
           {livePlacesById[selectedLandmark.id] && (
@@ -925,6 +1109,7 @@ export default function App() {
               onSelectLandmark={(lm) => {
                 setSelectedLandmark(lm);
                 setSelectedFact(lm.arFacts[0] || null);
+                fireTourHaptic('LANDMARK_ARRIVAL', lm.shortTitle);
               }}
               selectedFact={selectedFact}
               onSelectFact={setSelectedFact}
@@ -956,6 +1141,7 @@ export default function App() {
               onSelectLandmark={(lm) => {
                 setSelectedLandmark(lm);
                 setSelectedFact(lm.arFacts[0] || null);
+                fireTourHaptic('LANDMARK_ARRIVAL', lm.shortTitle);
               }}
               walkerPosition={walkerPosition}
               onStepWalkerToLandmark={handleStepWalkerToLandmark}
@@ -1258,6 +1444,7 @@ export default function App() {
               onSelectLandmark={(lm) => {
                 setSelectedLandmark(lm);
                 setSelectedFact(lm.arFacts[0] || null);
+                fireTourHaptic('LANDMARK_ARRIVAL', lm.shortTitle);
               }}
               walkerPosition={walkerPosition}
               onStepWalkerToLandmark={handleStepWalkerToLandmark}
