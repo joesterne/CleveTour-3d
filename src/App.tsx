@@ -26,6 +26,7 @@ import {
   interpolateTrailPosition,
   triggerDeviceHapticFeedback,
 } from './utils/tourLogic';
+import { APIProvider } from '@vis.gl/react-google-maps';
 import { Cleveland3DViewport } from './components/Cleveland3DViewport';
 import {
   ClevelandWalkingMap,
@@ -565,7 +566,23 @@ export default function App() {
     };
   }, []);
 
+  const googleMapsApiKey =
+    (import.meta as any).env?.VITE_GOOGLE_MAPS_API_KEY ||
+    (process.env.GOOGLE_MAPS_PLATFORM_KEY as string) ||
+    (process.env.GOOGLE_MAPS_API_KEY as string) ||
+    '';
+
+  const liveLocationsById = Object.fromEntries(
+    Object.entries(livePlacesById).map(([id, pl]) => [id, pl.location])
+  );
+
   return (
+    <APIProvider
+      apiKey={googleMapsApiKey}
+      libraries={['maps3d', 'marker', 'places', 'routes']}
+      language="en"
+      region="US"
+    >
     <div className="min-h-screen bg-[#0b111e] text-slate-100 flex flex-col">
       {/* Mandatory Google Maps Platform Demo Key Quota Banner */}
       {gmpQuotaExceeded && (
@@ -1132,6 +1149,9 @@ export default function App() {
               isOfflineAvailable={offlineStats.isLandmarkAvailableOffline(
                 selectedLandmark.id
               )}
+              hasGoogleMapsApiKey={Boolean(googleMapsApiKey)}
+              offlineMode={offlineMode}
+              liveLocationsById={liveLocationsById}
             />
 
             {/* Interactive Google Maps & Offline Vector Walking Guide */}
@@ -1703,5 +1723,6 @@ export default function App() {
         </button>
       </nav>
     </div>
+    </APIProvider>
   );
 }

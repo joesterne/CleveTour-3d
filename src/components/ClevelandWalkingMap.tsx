@@ -1,16 +1,25 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import {
-  APIProvider,
   Map as GoogleMap,
   AdvancedMarker,
   InfoWindow,
+  AltitudeMode,
   useMap,
   useMapsLibrary,
   useAdvancedMarkerRef,
 } from '@vis.gl/react-google-maps';
+import {
+  Map3D,
+  Map3DRef,
+  MapMode,
+  Marker3D,
+  Polyline3D,
+} from '@vis.gl/react-google-maps/3d';
 import { LandmarkBlueprint } from '../data/clevelandLandmarks';
 import {
   GeoPoint,
+  buildGoogle3DCameraPreset,
+  buildGoogle3DWalkingCorridorCoordinates,
   calculateCompassBearing,
   calculateHaversineDistanceMeters,
   estimateWalkingMinutes,
@@ -888,8 +897,39 @@ export const ClevelandWalkingMap: React.FC<ClevelandWalkingMapProps> = ({
     '';
 
   const [mapMode, setMapMode] = useState<
-    'HYBRID_GOOGLE' | 'STREET_VIEW_SPLIT' | 'OFFLINE_VECTOR'
+    'HYBRID_GOOGLE' | 'STREET_VIEW_SPLIT' | 'GOOGLE_EARTH_3D' | 'OFFLINE_VECTOR'
   >(offlineMode ? 'OFFLINE_VECTOR' : 'STREET_VIEW_SPLIT');
+
+  const walkingMap3DRef = useRef<Map3DRef | null>(null);
+  const walking3DCameraPose = buildGoogle3DCameraPreset(
+    selectedLandmark,
+    livePlacesById[selectedLandmark.id]?.location || null
+  );
+  const walking3DCorridor = buildGoogle3DWalkingCorridorCoordinates(
+    landmarks,
+    Object.fromEntries(
+      Object.entries(livePlacesById).map(([id, pl]) => [id, pl.location])
+    )
+  );
+
+  useEffect(() => {
+    if (mapMode === 'GOOGLE_EARTH_3D' && walkingMap3DRef.current?.map3d) {
+      try {
+        walkingMap3DRef.current.flyCameraTo({
+          endCamera: {
+            center: walking3DCameraPose.center,
+            range: walking3DCameraPose.range,
+            tilt: walking3DCameraPose.tilt,
+            heading: walking3DCameraPose.heading,
+            roll: 0,
+          },
+          durationMillis: 1400,
+        });
+      } catch {
+        // Ignore
+      }
+    }
+  }, [selectedLandmark, mapMode, walking3DCameraPose]);
 
   const [routeStats, setRouteStats] = useState<{
     distanceMeters: number;
@@ -965,7 +1005,7 @@ export const ClevelandWalkingMap: React.FC<ClevelandWalkingMapProps> = ({
           <h3 className="text-sm font-bold text-white flex items-center gap-2">
             <Navigation className="w-4 h-4 text-amber-400" />
             <span>
-              Live Google Maps Platform — Pedestrian Routes, Places (New) & 360° Street View
+              Live Google Maps Platform — Pedestrian Routes, Places (New), Google Earth 3D & 360° Vista
             </span>
           </h3>
           <p className="text-xs text-slate-400 mt-0.5 font-mono">
@@ -986,7 +1026,7 @@ export const ClevelandWalkingMap: React.FC<ClevelandWalkingMapProps> = ({
             <button
               type="button"
               onClick={() => setMapMode('STREET_VIEW_SPLIT')}
-              className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+              className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                 mapMode === 'STREET_VIEW_SPLIT'
                   ? 'bg-amber-500 text-slate-950 font-semibold'
                   : 'text-slate-300 hover:text-white'
@@ -996,8 +1036,20 @@ export const ClevelandWalkingMap: React.FC<ClevelandWalkingMapProps> = ({
             </button>
             <button
               type="button"
+              onClick={() => setMapMode('GOOGLE_EARTH_3D')}
+              data-testid="walking-map-google-earth-3d-btn"
+              className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                mapMode === 'GOOGLE_EARTH_3D'
+                  ? 'bg-amber-500 text-slate-950 font-semibold'
+                  : 'text-slate-300 hover:text-white'
+              }`}
+            >
+              Google Earth 3D Tiles
+            </button>
+            <button
+              type="button"
               onClick={() => setMapMode('HYBRID_GOOGLE')}
-              className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+              className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                 mapMode === 'HYBRID_GOOGLE'
                   ? 'bg-amber-500 text-slate-950 font-semibold'
                   : 'text-slate-300 hover:text-white'
@@ -1008,7 +1060,7 @@ export const ClevelandWalkingMap: React.FC<ClevelandWalkingMapProps> = ({
             <button
               type="button"
               onClick={() => setMapMode('OFFLINE_VECTOR')}
-              className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+              className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                 mapMode === 'OFFLINE_VECTOR'
                   ? 'bg-amber-500 text-slate-950 font-semibold'
                   : 'text-slate-300 hover:text-white'
@@ -1105,118 +1157,200 @@ export const ClevelandWalkingMap: React.FC<ClevelandWalkingMapProps> = ({
         </div>
       )}
 
-      {/* Main Map & 360° Street View Container (Explicit CSS height per CF2) */}
+      {/* Main Map, Google Earth 3D & 360° Street View Container (Explicit CSS height per CF2) */}
       <div className="relative w-full h-[460px] bg-[#0b1324]">
-        {mapMode !== 'OFFLINE_VECTOR' && apiKey && !offlineMode ? (
-          <APIProvider apiKey={apiKey} language="en" region="US">
-            <div
-              className={`w-full h-full grid ${
-                mapMode === 'STREET_VIEW_SPLIT'
-                  ? 'grid-cols-1 lg:grid-cols-12'
-                  : 'grid-cols-1'
-              }`}
+        {mapMode === 'GOOGLE_EARTH_3D' && apiKey && !offlineMode ? (
+          <div
+            className="relative w-full h-full"
+            data-testid="walking-map-google-earth-3d-view"
+          >
+            <Map3D
+              ref={walkingMap3DRef}
+              id="cleveland-walking-guide-3d-map"
+              mode={MapMode.HYBRID}
+              defaultCenter={walking3DCameraPose.center}
+              defaultRange={walking3DCameraPose.range}
+              defaultTilt={walking3DCameraPose.tilt}
+              defaultHeading={walking3DCameraPose.heading}
+              defaultRoll={0}
+              internalUsageAttributionIds={[
+                'gmp_mcp_codeassist_v1_aistudio',
+              ]}
+              style={{ width: '100%', height: '100%' }}
             >
-              <div
-                className={
-                  mapMode === 'STREET_VIEW_SPLIT'
-                    ? 'lg:col-span-7 h-[260px] lg:h-full'
-                    : 'w-full h-full'
-                }
+              <Polyline3D
+                path={walking3DCorridor}
+                altitudeMode={AltitudeMode.RELATIVE_TO_GROUND}
+                strokeColor="#f59e0b"
+                outerColor="#0f172a"
+                strokeWidth={8}
+                outerWidth={0.25}
+                extruded
+              />
+
+              {/* Tourist Live Foot-Traffic 3D Marker */}
+              <Marker3D
+                position={{
+                  lat: walkerPosition.lat,
+                  lng: walkerPosition.lng,
+                  altitude: 35,
+                }}
+                altitudeMode={AltitudeMode.RELATIVE_TO_GROUND}
+                extruded
+                label="YOU (WALKER GPS)"
+                title="Your Live Walking Position"
+              />
+
+              {/* 6 Cleveland Landmark 3D Markers */}
+              {landmarks.map((lm) => {
+                const liveLoc = livePlacesById[lm.id]?.location;
+                return (
+                  <Marker3D
+                    key={`walk3d-${lm.id}`}
+                    position={{
+                      lat: liveLoc?.lat ?? lm.tourAnchor.lat,
+                      lng: liveLoc?.lng ?? lm.tourAnchor.lng,
+                      altitude: lm.id === selectedLandmark.id ? 78 : 45,
+                    }}
+                    altitudeMode={AltitudeMode.RELATIVE_TO_GROUND}
+                    extruded
+                    label={`0${lm.walkingOrder}. ${lm.shortTitle}`}
+                    title={lm.shortTitle}
+                    onClick={() => {
+                      setSelectedNearbyPlace(null);
+                      onSelectLandmark(lm);
+                    }}
+                  />
+                );
+              })}
+
+              {/* Discovered Nearby Places 3D Markers */}
+              {discoveredPlaces.map((np) => (
+                <Marker3D
+                  key={`walk3d-np-${np.id}`}
+                  position={{
+                    lat: np.location.lat,
+                    lng: np.location.lng,
+                    altitude: 30,
+                  }}
+                  altitudeMode={AltitudeMode.RELATIVE_TO_GROUND}
+                  extruded
+                  label={`★ ${np.displayName}`}
+                  title={np.displayName}
+                  onClick={() => setSelectedNearbyPlace(np)}
+                />
+              ))}
+            </Map3D>
+          </div>
+        ) : mapMode !== 'OFFLINE_VECTOR' && apiKey && !offlineMode ? (
+          <div
+            className={`w-full h-full grid ${
+              mapMode === 'STREET_VIEW_SPLIT'
+                ? 'grid-cols-1 lg:grid-cols-12'
+                : 'grid-cols-1'
+            }`}
+          >
+            <div
+              className={
+                mapMode === 'STREET_VIEW_SPLIT'
+                  ? 'lg:col-span-7 h-[260px] lg:h-full'
+                  : 'w-full h-full'
+              }
+            >
+              <GoogleMap
+                id="cleveland-2d-walking-map"
+                mapId="DEMO_MAP_ID"
+                defaultCenter={{ lat: 41.4984, lng: -81.6954 }}
+                defaultZoom={14}
+                gestureHandling="greedy"
+                internalUsageAttributionIds={[
+                  'gmp_mcp_codeassist_v1_aistudio',
+                ]}
+                style={{ width: '100%', height: '100%' }}
               >
-                <GoogleMap
-                  mapId="DEMO_MAP_ID"
-                  defaultCenter={{ lat: 41.4984, lng: -81.6954 }}
-                  defaultZoom={14}
-                  gestureHandling="greedy"
-                  internalUsageAttributionIds={[
-                    'gmp_mcp_codeassist_v1_aistudio',
-                  ]}
-                  style={{ width: '100%', height: '100%' }}
+                <RouteAndPlacesController
+                  landmarks={landmarks}
+                  origin={walkerPosition}
+                  selectedLandmark={selectedLandmark}
+                  customDestination={selectedNearbyPlace}
+                  offlineMode={offlineMode}
+                  nearbyCategory={nearbyCategory}
+                  customSearchQuery={customSearchInput}
+                  searchTriggerCounter={searchTriggerCounter}
+                  onRouteComputed={setRouteStats}
+                  onFullTrailComputed={setFullTrailStats}
+                  onPlaceLoaded={onPlaceLoaded}
+                  onNearbyPlacesLoaded={setDiscoveredPlaces}
+                  onSearchingChange={setIsSearchingPlaces}
+                />
+
+                {/* Tourist Live Foot-Traffic Marker */}
+                <AdvancedMarker
+                  position={walkerPosition}
+                  title="Your Walking Position (GPS / Simulator)"
                 >
-                  <RouteAndPlacesController
-                    landmarks={landmarks}
-                    origin={walkerPosition}
-                    selectedLandmark={selectedLandmark}
-                    customDestination={selectedNearbyPlace}
-                    offlineMode={offlineMode}
-                    nearbyCategory={nearbyCategory}
-                    customSearchQuery={customSearchInput}
-                    searchTriggerCounter={searchTriggerCounter}
-                    onRouteComputed={setRouteStats}
-                    onFullTrailComputed={setFullTrailStats}
-                    onPlaceLoaded={onPlaceLoaded}
-                    onNearbyPlacesLoaded={setDiscoveredPlaces}
-                    onSearchingChange={setIsSearchingPlaces}
-                  />
+                  <div className="px-2.5 py-1 rounded-full bg-sky-500 text-slate-950 border-2 border-white font-mono text-[11px] font-bold shadow-lg">
+                    YOU (WALKER)
+                  </div>
+                </AdvancedMarker>
 
-                  {/* Tourist Live Foot-Traffic Marker */}
-                  <AdvancedMarker
-                    position={walkerPosition}
-                    title="Your Walking Position (GPS / Simulator)"
-                  >
-                    <div className="px-2.5 py-1 rounded-full bg-sky-500 text-slate-950 border-2 border-white font-mono text-[11px] font-bold shadow-lg">
-                      YOU (WALKER)
-                    </div>
-                  </AdvancedMarker>
-
-                  {/* Cleveland Landmark Advanced Markers */}
-                  {landmarks.map((lm) => (
-                    <LandmarkPinMarker
-                      key={lm.id}
-                      landmark={lm}
-                      isSelected={
-                        lm.id === selectedLandmark.id && !selectedNearbyPlace
-                      }
-                      onSelect={() => {
-                        setSelectedNearbyPlace(null);
-                        onSelectLandmark(lm);
-                      }}
-                      livePlace={livePlacesById[lm.id]}
-                    />
-                  ))}
-
-                  {/* Discovered Nearby Google Places Markers */}
-                  {discoveredPlaces.map((np) => {
-                    const isPicked = selectedNearbyPlace?.id === np.id;
-                    return (
-                      <AdvancedMarker
-                        key={np.id}
-                        position={np.location}
-                        onClick={() => setSelectedNearbyPlace(np)}
-                        title={np.displayName}
-                      >
-                        <div
-                          className={`px-2 py-1 rounded-lg border text-[11px] font-semibold shadow-md transition-transform ${
-                            isPicked
-                              ? 'bg-emerald-400 text-slate-950 border-white scale-110'
-                              : 'bg-emerald-950/95 text-emerald-200 border-emerald-400/70 hover:scale-105'
-                          }`}
-                        >
-                          ★ {np.displayName}
-                        </div>
-                      </AdvancedMarker>
-                    );
-                  })}
-                </GoogleMap>
-              </div>
-
-              {mapMode === 'STREET_VIEW_SPLIT' && (
-                <div className="lg:col-span-5 h-[200px] lg:h-full border-t lg:border-t-0 lg:border-l border-slate-800">
-                  <StreetViewPanoramaPanel
-                    targetPosition={targetCoords}
-                    landmarkTitle={
-                      selectedNearbyPlace?.displayName ||
-                      activeLivePlace?.displayName ||
-                      selectedLandmark.shortTitle
+                {/* Cleveland Landmark Advanced Markers */}
+                {landmarks.map((lm) => (
+                  <LandmarkPinMarker
+                    key={lm.id}
+                    landmark={lm}
+                    isSelected={
+                      lm.id === selectedLandmark.id && !selectedNearbyPlace
                     }
-                    landmark={selectedLandmark}
-                    livePlace={activeLivePlace}
-                    nearbyPlace={selectedNearbyPlace}
+                    onSelect={() => {
+                      setSelectedNearbyPlace(null);
+                      onSelectLandmark(lm);
+                    }}
+                    livePlace={livePlacesById[lm.id]}
                   />
-                </div>
-              )}
+                ))}
+
+                {/* Discovered Nearby Google Places Markers */}
+                {discoveredPlaces.map((np) => {
+                  const isPicked = selectedNearbyPlace?.id === np.id;
+                  return (
+                    <AdvancedMarker
+                      key={np.id}
+                      position={np.location}
+                      onClick={() => setSelectedNearbyPlace(np)}
+                      title={np.displayName}
+                    >
+                      <div
+                        className={`px-2 py-1 rounded-lg border text-[11px] font-semibold shadow-md transition-transform ${
+                          isPicked
+                            ? 'bg-emerald-400 text-slate-950 border-white scale-110'
+                            : 'bg-emerald-950/95 text-emerald-200 border-emerald-400/70 hover:scale-105'
+                        }`}
+                      >
+                        ★ {np.displayName}
+                      </div>
+                    </AdvancedMarker>
+                  );
+                })}
+              </GoogleMap>
             </div>
-          </APIProvider>
+
+            {mapMode === 'STREET_VIEW_SPLIT' && (
+              <div className="lg:col-span-5 h-[200px] lg:h-full border-t lg:border-t-0 lg:border-l border-slate-800">
+                <StreetViewPanoramaPanel
+                  targetPosition={targetCoords}
+                  landmarkTitle={
+                    selectedNearbyPlace?.displayName ||
+                    activeLivePlace?.displayName ||
+                    selectedLandmark.shortTitle
+                  }
+                  landmark={selectedLandmark}
+                  livePlace={activeLivePlace}
+                  nearbyPlace={selectedNearbyPlace}
+                />
+              </div>
+            )}
+          </div>
         ) : (
           /* High-Precision Offline Topographic Vector Map of Cleveland */
           <div

@@ -22,6 +22,9 @@ import {
   computeLandmarkSightlineBearing,
   computeGyroCompassAlignment,
   buildARDiscoverySharePayload,
+  buildGoogle3DCameraPreset,
+  computeARFactGeoAltitudePoint,
+  buildGoogle3DWalkingCorridorCoordinates,
 } from './tourLogic';
 import {
   CLEVELAND_LANDMARKS,
@@ -441,6 +444,35 @@ test('buildARDiscoverySharePayload generates social media intent URLs and format
   assert.ok(payload.platformUrls.REDDIT.startsWith('https://www.reddit.com/submit?'));
   assert.ok(payload.platformUrls.EMAIL.startsWith('mailto:?subject='));
 });
+
+test('buildGoogle3DCameraPreset, computeARFactGeoAltitudePoint, and buildGoogle3DWalkingCorridorCoordinates compute Google Maps 3D and Google Earth coordinates accurately', () => {
+  const terminalTower = CLEVELAND_LANDMARKS[0];
+  const cameraPreset = buildGoogle3DCameraPreset(terminalTower);
+
+  assert.equal(cameraPreset.center.lat, 41.4984);
+  assert.equal(cameraPreset.center.lng, -81.6937);
+  assert.equal(cameraPreset.center.altitude, 286); // 201m ASL + 85m offset
+  assert.equal(cameraPreset.range, 460);
+  assert.equal(cameraPreset.tilt, 67.5);
+  assert.equal(cameraPreset.heading, 142);
+  assert.ok(cameraPreset.googleEarthUrl.startsWith('https://earth.google.com/web/@41.498400,-81.693700'));
+  assert.ok(cameraPreset.googleMaps3DUrl.startsWith('https://www.google.com/maps/@41.498400,-81.693700'));
+
+  const factPin = computeARFactGeoAltitudePoint(
+    terminalTower,
+    terminalTower.arFacts[0]
+  );
+  assert.equal(factPin.factId, 'tt-fact-1');
+  assert.ok(Math.abs(factPin.lat - 41.4984) < 0.002);
+  assert.ok(Math.abs(factPin.lng - -81.6937) < 0.002);
+  assert.ok(factPin.altitudeMeters >= 50);
+
+  const corridor = buildGoogle3DWalkingCorridorCoordinates(CLEVELAND_LANDMARKS);
+  assert.equal(corridor.length, 6);
+  assert.equal(corridor[0].lat, 41.4984);
+  assert.equal(corridor[0].altitude, 22);
+});
+
 
 
 

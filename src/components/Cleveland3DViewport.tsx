@@ -2,6 +2,15 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { AltitudeMode } from '@vis.gl/react-google-maps';
+import {
+  Map3D,
+  Map3DRef,
+  MapMode,
+  Marker3D,
+  Polyline3D,
+  Map3DCameraChangedEvent,
+} from '@vis.gl/react-google-maps/3d';
 import {
   ARHistoricalFact,
   CLEVELAND_LANDMARKS,
@@ -9,8 +18,12 @@ import {
   SANDSTONE_TEXTURE_PATH,
 } from '../data/clevelandLandmarks';
 import {
+  GeoPoint,
   GyroOrientationInput,
   buildARDiscoverySharePayload,
+  buildGoogle3DCameraPreset,
+  buildGoogle3DWalkingCorridorCoordinates,
+  computeARFactGeoAltitudePoint,
   computeGyroCompassAlignment,
   computeLandmarkSightlineBearing,
   filterARFactsByEra,
@@ -25,6 +38,7 @@ import {
   Download,
   ExternalLink,
   Eye,
+  Globe,
   Heart,
   Layers,
   Navigation,
@@ -61,6 +75,9 @@ interface Cleveland3DViewportProps {
   onOpenShareModal: (landmark: LandmarkBlueprint, fact?: ARHistoricalFact | null) => void;
   onOpenViroExport: (landmark: LandmarkBlueprint) => void;
   isOfflineAvailable: boolean;
+  hasGoogleMapsApiKey?: boolean;
+  offlineMode?: boolean;
+  liveLocationsById?: Record<string, GeoPoint | undefined>;
 }
 
 const isSoftwareGl = (() => {
@@ -165,15 +182,44 @@ export const Cleveland3DViewport: React.FC<Cleveland3DViewportProps> = ({
   onOpenShareModal,
   onOpenViroExport,
   isOfflineAvailable,
+  hasGoogleMapsApiKey = true,
+  offlineMode = false,
+  liveLocationsById,
 }) => {
   const canvasMountRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const map3DRef = useRef<Map3DRef | null>(null);
   const [dockCollapsed, setDockCollapsed] = useState(false);
   const [cameraFeedActive, setCameraFeedActive] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [audioSpeaking, setAudioSpeaking] = useState(false);
   const [projectedNodes, setProjectedNodes] = useState<ProjectedFactNode[]>([]);
   const [finishMode, setFinishMode] = useState<'REALISTIC' | 'ARCHITECTURAL_CLAY' | 'BLUEPRINT'>('REALISTIC');
+
+  // Google Maps 3D / Google Earth Photorealistic 3D Tiles Engine State
+  const [viewportEngine, setViewportEngine] = useState<
+    'GOOGLE_EARTH_3D' | 'ARCHITECTURAL_3D_AR'
+  >(() =>
+    hasGoogleMapsApiKey && !offlineMode ? 'GOOGLE_EARTH_3D' : 'ARCHITECTURAL_3D_AR'
+  );
+  const [google3DMapMode, setGoogle3DMapMode] = useState<'HYBRID' | 'SATELLITE'>('HYBRID');
+  const [google3DOrbiting, setGoogle3DOrbiting] = useState<boolean>(false);
+
+  // Switch gracefully if offlineMode toggles on
+  useEffect(() => {
+    if (offlineMode && viewportEngine === 'GOOGLE_EARTH_3D') {
+      setViewportEngine('ARCHITECTURAL_3D_AR');
+    }
+  }, [offlineMode, viewportEngine]);
+
+  const google3DCameraPose = buildGoogle3DCameraPreset(
+    selectedLandmark,
+    liveLocationsById?.[selectedLandmark.id] || null
+  );
+  const google3DCorridorCoords = buildGoogle3DWalkingCorridorCoordinates(
+    landmarks,
+    liveLocationsById
+  );
 
   // Store latest props in refs so WebGL scene never tears down on HUD state updates
   const selectedLandmarkRef = useRef(selectedLandmark);
@@ -236,6 +282,97 @@ export const Cleveland3DViewport: React.FC<Cleveland3DViewportProps> = ({
     targetLandmarkTitle: sightlineSpec.targetTitle,
   });
 
+  // Fly Google Maps 3D camera smoothly when selectedLandmark changes
+  useEffect(() => {
+    const pose = buildGoogle3DCameraPreset(
+      selectedLandmark,
+      liveLocationsById?.[selectedLandmark.id] || null
+    );
+    setGoogle3DOrbiting(false);
+    if (map3DRef.current?.map3d) {
+      try {
+        map3DRef.current.flyCameraTo({
+          endCamera: {
+            center: pose.center,
+            range: pose.range,
+            tilt: pose.tilt,
+            heading: pose.heading,
+            roll: pose.roll,
+          },
+          durationMillis: 1500,
+        });
+      } catch {
+        // Fallback direct assignment if flyCameraTo is not yet ready
+        Object.assign(map3DRef.current.map3d, {
+          center: pose.center,
+          range: pose.range,
+          tilt: pose.tilt,
+          heading: pose.heading,
+          roll: pose.roll,
+        });
+      }
+    }
+  }, [selectedLandmark, liveLocationsById]);
+
+  const handleToggleGoogle3DOrbit = useCallback(() => {
+    const pose = buildGoogle3DCameraPreset(
+      selectedLandmarkRef.current,
+      liveLocationsById?.[selectedLandmarkRef.current.id] || null
+    );
+    if (!map3DRef.current?.map3d) {
+      setGoogle3DOrbiting((prev) => !prev);
+      return;
+    }
+    if (google3DOrbiting) {
+      try {
+        map3DRef.current.stopCameraAnimation();
+      } catch {
+        // Ignore
+      }
+      setGoogle3DOrbiting(false);
+    } else {
+      try {
+        map3DRef.current.flyCameraAround({
+          camera: {
+            center: pose.center,
+            range: pose.range,
+            tilt: pose.tilt,
+            heading: pose.heading,
+            roll: 0,
+          },
+          durationMillis: 18000,
+          repeatCount: 1,
+        } as any);
+      } catch {
+        // Ignore
+      }
+      setGoogle3DOrbiting(true);
+    }
+  }, [google3DOrbiting, liveLocationsById]);
+
+  const handleGoogle3DCameraChanged = useCallback(
+    (ev: Map3DCameraChangedEvent) => {
+      if (hasHardwareGyroRef.current) return;
+      const now = performance.now();
+      if (now - lastOrbitGyroSyncRef.current < 140) return;
+      lastOrbitGyroSyncRef.current = now;
+      const heading = ev?.detail?.heading;
+      if (typeof heading === 'number' && !Number.isNaN(heading)) {
+        const normalized = Math.round(((heading % 360) + 360) % 360) % 360;
+        const nextAlpha = (360 - normalized) % 360;
+        setGyroOrientation((prev) => {
+          if (prev.alpha !== null && Math.abs(prev.alpha - nextAlpha) < 1) return prev;
+          return {
+            ...prev,
+            alpha: nextAlpha,
+            webkitCompassHeading: null,
+          };
+        });
+      }
+    },
+    []
+  );
+
   // Pivot 3D camera around the active landmark to match a compass heading (0..359°)
   const syncCameraToCompassHeading = useCallback(
     (headingDeg: number, lm: LandmarkBlueprint = selectedLandmarkRef.current) => {
@@ -258,6 +395,15 @@ export const Cleveland3DViewport: React.FC<Cleveland3DViewportProps> = ({
         active: true,
       };
       requestRenderRef.current();
+
+      // Also sync Google Maps 3D Photorealistic camera heading when active
+      if (map3DRef.current?.map3d) {
+        try {
+          map3DRef.current.map3d.heading = headingDeg;
+        } catch {
+          // Ignore
+        }
+      }
     },
     []
   );
@@ -1407,11 +1553,12 @@ export const Cleveland3DViewport: React.FC<Cleveland3DViewportProps> = ({
     };
   }, []);
 
-  const visibleFactsCount = filterARFactsByEra(
+  const filteredArFacts = filterARFactsByEra(
     selectedLandmark.arFacts,
     eraMaxYear,
     factCategory
-  ).length;
+  );
+  const visibleFactsCount = filteredArFacts.length;
 
   return (
     <div className="space-y-3 md:space-y-0">
@@ -1429,8 +1576,103 @@ export const Cleveland3DViewport: React.FC<Cleveland3DViewportProps> = ({
           }`}
         />
 
-        {/* Isolated WebGL Canvas Container (Zero backdrop-filter over canvas) */}
-        <div ref={canvasMountRef} className="w-full h-full cursor-grab active:cursor-grabbing" />
+        {/* Isolated Three.js Architectural 3D & ViroReact AR Canvas Container */}
+        <div
+          ref={canvasMountRef}
+          className={`w-full h-full cursor-grab active:cursor-grabbing ${
+            viewportEngine === 'GOOGLE_EARTH_3D' ? 'opacity-35 pointer-events-none' : ''
+          }`}
+        />
+
+        {/* Actual Google Maps 3D / Google Earth Photorealistic 3D Tiles Layer (<gmp-map-3d>) */}
+        {viewportEngine === 'GOOGLE_EARTH_3D' &&
+          hasGoogleMapsApiKey &&
+          !offlineMode && (
+            <div
+              className="absolute inset-0 z-[5] w-full h-full"
+              data-testid="google-earth-3d-viewport-layer"
+            >
+              <Map3D
+                ref={map3DRef}
+                id="cleveland-photorealistic-3d-map"
+                mode={
+                  google3DMapMode === 'HYBRID'
+                    ? MapMode.HYBRID
+                    : MapMode.SATELLITE
+                }
+                defaultCenter={google3DCameraPose.center}
+                defaultRange={google3DCameraPose.range}
+                defaultTilt={google3DCameraPose.tilt}
+                defaultHeading={google3DCameraPose.heading}
+                defaultRoll={0}
+                onCameraChanged={handleGoogle3DCameraChanged}
+                internalUsageAttributionIds={[
+                  'gmp_mcp_codeassist_v1_aistudio',
+                ]}
+                style={{ width: '100%', height: '100%' }}
+              >
+                {/* 3D Elevated Walking Corridor Polyline across Cleveland Landmarks */}
+                <Polyline3D
+                  path={google3DCorridorCoords}
+                  altitudeMode={AltitudeMode.RELATIVE_TO_GROUND}
+                  strokeColor="#f59e0b"
+                  outerColor="#0f172a"
+                  strokeWidth={8}
+                  outerWidth={0.25}
+                  extruded
+                />
+
+                {/* 3D Extruded Pins for all 6 Iconic Cleveland Landmarks */}
+                {landmarks.map((lm) => {
+                  const liveLoc = liveLocationsById?.[lm.id];
+                  const isCurrent = lm.id === selectedLandmark.id;
+                  return (
+                    <Marker3D
+                      key={`g3d-lm-${lm.id}`}
+                      position={{
+                        lat: liveLoc?.lat ?? lm.tourAnchor.lat,
+                        lng: liveLoc?.lng ?? lm.tourAnchor.lng,
+                        altitude: isCurrent ? 78 : 45,
+                      }}
+                      altitudeMode={AltitudeMode.RELATIVE_TO_GROUND}
+                      extruded
+                      label={`0${lm.walkingOrder}. ${lm.shortTitle} (${lm.yearCompleted})`}
+                      title={`${lm.shortTitle} — ${lm.architecturalStyle}`}
+                      onClick={() => {
+                        onSelectLandmark(lm);
+                        onSelectFact(lm.arFacts[0] || null);
+                      }}
+                    />
+                  );
+                })}
+
+                {/* 3D Spatial AR Historical Fact Markers Projected at Real Altitude around Active Landmark */}
+                {arLensActive &&
+                  filteredArFacts.map((fact) => {
+                    const geoPin = computeARFactGeoAltitudePoint(
+                      selectedLandmark,
+                      fact,
+                      liveLocationsById?.[selectedLandmark.id] || null
+                    );
+                    return (
+                      <Marker3D
+                        key={`g3d-fact-${fact.id}`}
+                        position={{
+                          lat: geoPin.lat,
+                          lng: geoPin.lng,
+                          altitude: geoPin.altitudeMeters,
+                        }}
+                        altitudeMode={AltitudeMode.RELATIVE_TO_GROUND}
+                        extruded
+                        label={`[AR ${fact.year}] ${fact.title}`}
+                        title={`${fact.eraLabel}: ${fact.title}`}
+                        onClick={() => onSelectFact(fact)}
+                      />
+                    );
+                  })}
+              </Map3D>
+            </div>
+          )}
 
         {/* Top-Left Minimal Spec Header */}
         <div className="absolute top-3 left-3 right-3 md:right-auto md:top-4 md:left-4 z-10 pointer-events-auto md:max-w-md bg-[#0f172ae6] border border-slate-700/80 rounded-xl px-3.5 py-2.5 md:px-4 md:py-3 shadow-lg">
@@ -1477,21 +1719,50 @@ export const Cleveland3DViewport: React.FC<Cleveland3DViewportProps> = ({
             {selectedLandmark.architecturalStyle} — {selectedLandmark.architect}
           </p>
 
-          <div className="hidden sm:flex items-center gap-3 mt-2.5 pt-2 border-t border-slate-800 text-[11px] font-mono text-slate-400">
+          <div className="hidden sm:flex flex-wrap items-center gap-2 mt-2.5 pt-2 border-t border-slate-800 text-[11px] font-mono text-slate-400">
             <span>
-              {selectedLandmark.tourAnchor.lat.toFixed(4)}°N,{' '}
-              {Math.abs(selectedLandmark.tourAnchor.lng).toFixed(4)}°W
+              {google3DCameraPose.center.lat.toFixed(4)}°N,{' '}
+              {Math.abs(google3DCameraPose.center.lng).toFixed(4)}°W
             </span>
             <span aria-hidden="true">·</span>
-            <span>{visibleFactsCount} AR Nodes Active</span>
-            <span aria-hidden="true">·</span>
-            <span className={isOfflineAvailable ? 'text-emerald-400' : 'text-amber-300'}>
-              {isOfflineAvailable ? 'Offline Mesh Cached' : 'Live Stream'}
+            <span className="text-sky-300">
+              {viewportEngine === 'GOOGLE_EARTH_3D'
+                ? `Google 3D Tiles (${google3DMapMode}) · Alt ${google3DCameraPose.center.altitude}m · Tilt ${google3DCameraPose.tilt}°`
+                : `${visibleFactsCount} AR Nodes Active`}
             </span>
+            <span aria-hidden="true">·</span>
+            <a
+              href={google3DCameraPose.googleEarthUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              data-testid="open-google-earth-web-link"
+              className="text-amber-300 hover:underline inline-flex items-center gap-1"
+            >
+              <span>Google Earth 3D</span>
+              <ExternalLink className="w-3 h-3" />
+            </a>
           </div>
 
           {/* Compact Mobile Action Row inside Header Card (< md) */}
           <div className="flex md:hidden items-center gap-2 mt-2 pt-2 border-t border-slate-800">
+            <button
+              type="button"
+              onClick={() =>
+                setViewportEngine((prev) =>
+                  prev === 'GOOGLE_EARTH_3D'
+                    ? 'ARCHITECTURAL_3D_AR'
+                    : 'GOOGLE_EARTH_3D'
+                )
+              }
+              className="flex-1 flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-amber-500/20 text-amber-300 border border-amber-500/40 whitespace-nowrap"
+            >
+              <Globe className="w-3.5 h-3.5" />
+              <span>
+                {viewportEngine === 'GOOGLE_EARTH_3D'
+                  ? 'Google 3D Tiles'
+                  : '3D AR Mesh'}
+              </span>
+            </button>
             <button
               type="button"
               onClick={() => toggleNarration(selectedLandmark, selectedFact)}
@@ -1504,19 +1775,44 @@ export const Cleveland3DViewport: React.FC<Cleveland3DViewportProps> = ({
               {audioSpeaking ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
               <span>{audioSpeaking ? 'Stop Audio' : 'Audio Guide'}</span>
             </button>
-            <button
-              type="button"
-              onClick={() => onOpenViroExport(selectedLandmark)}
-              className="flex-1 flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-slate-800/90 text-sky-300 border border-sky-500/40 whitespace-nowrap"
-            >
-              <Code2 className="w-3.5 h-3.5" />
-              <span>ViroReact Code</span>
-            </button>
           </div>
         </div>
 
-        {/* Top-Right ViroReact AR Reticle & Audio Guide Controls (Desktop md+) */}
+        {/* Top-Right 3D Engine Switcher (Google Earth 3D Tiles vs Architectural 3D AR), Audio & ViroReact Controls (Desktop md+) */}
         <div className="hidden md:flex absolute top-4 right-4 z-10 items-center gap-2 pointer-events-auto">
+          <div
+            className="flex items-center bg-[#0f172ae6] p-1 rounded-xl border border-slate-700 shadow-lg"
+            role="group"
+            aria-label="3D Viewport Data Source Switcher"
+          >
+            <button
+              type="button"
+              onClick={() => setViewportEngine('GOOGLE_EARTH_3D')}
+              data-testid="engine-google-earth-3d-btn"
+              className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap cursor-pointer ${
+                viewportEngine === 'GOOGLE_EARTH_3D'
+                  ? 'bg-amber-500 text-slate-950'
+                  : 'text-slate-300 hover:text-white'
+              }`}
+            >
+              <Globe className="w-3.5 h-3.5" />
+              <span>Google Earth 3D Tiles</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setViewportEngine('ARCHITECTURAL_3D_AR')}
+              data-testid="engine-architectural-3d-btn"
+              className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap cursor-pointer ${
+                viewportEngine === 'ARCHITECTURAL_3D_AR'
+                  ? 'bg-amber-500 text-slate-950'
+                  : 'text-slate-300 hover:text-white'
+              }`}
+            >
+              <Layers className="w-3.5 h-3.5" />
+              <span>Architectural 3D Mesh</span>
+            </button>
+          </div>
+
           <button
             type="button"
             onClick={() => toggleNarration(selectedLandmark, selectedFact)}
@@ -1543,9 +1839,27 @@ export const Cleveland3DViewport: React.FC<Cleveland3DViewportProps> = ({
         {/* Projected 3D Spatial AR Fact Overlays (Semantic DOM Nodes with Direct Share Action) */}
         {arLensActive && (
           <div className="absolute inset-0 pointer-events-none z-10">
-            {/* Subtle ViroReact Spatial Calibration Reticle + Direct Share AR View Button */}
+            {/* Subtle ViroReact & Google Maps 3D Spatial Calibration Reticle + Direct Share AR View Button */}
             <div className="hidden md:flex items-center gap-2 absolute top-20 right-4 bg-[#0f172ae6] border border-amber-500/40 rounded-lg px-3 py-1.5 text-[11px] font-mono text-amber-300 pointer-events-auto">
-              <span>ViroARScene · World Tracking Normal · Era ≤ {eraMaxYear}</span>
+              <span>
+                {viewportEngine === 'GOOGLE_EARTH_3D'
+                  ? `Google Maps 3D (<gmp-map-3d>) · Range ${google3DCameraPose.range}m · Era ≤ ${eraMaxYear}`
+                  : `ViroARScene · World Tracking Normal · Era ≤ ${eraMaxYear}`}
+              </span>
+              {viewportEngine === 'GOOGLE_EARTH_3D' && (
+                <button
+                  type="button"
+                  onClick={handleToggleGoogle3DOrbit}
+                  data-testid="google-3d-orbit-btn"
+                  className={`px-2 py-0.5 rounded border text-[10px] font-semibold transition-colors cursor-pointer ${
+                    google3DOrbiting
+                      ? 'bg-emerald-500 text-slate-950 border-emerald-300'
+                      : 'bg-sky-500/20 hover:bg-sky-500 text-sky-300 hover:text-slate-950 border-sky-500/50'
+                  }`}
+                >
+                  {google3DOrbiting ? 'Stop 360° Fly-Around' : '360° Fly-Around'}
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => handleOpenDirectARShare(selectedFact)}
@@ -2199,29 +2513,50 @@ export const Cleveland3DViewport: React.FC<Cleveland3DViewportProps> = ({
                 <option value="Cultural Milestone">Cultural Milestone</option>
               </select>
 
-              <button
-                type="button"
-                onClick={() =>
-                  setFinishMode((m) =>
-                    m === 'REALISTIC'
-                      ? 'ARCHITECTURAL_CLAY'
-                      : m === 'ARCHITECTURAL_CLAY'
-                      ? 'BLUEPRINT'
-                      : 'REALISTIC'
-                  )
-                }
-                aria-label="Cycle 3D surface rendering style"
-                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-800 border border-slate-700 text-slate-200 hover:text-white text-xs font-medium whitespace-nowrap shrink-0"
-              >
-                <Layers className="w-3.5 h-3.5 text-sky-400" />
-                <span>
-                  {finishMode === 'REALISTIC'
-                    ? 'PBR Stone'
-                    : finishMode === 'ARCHITECTURAL_CLAY'
-                    ? 'Clay Model'
-                    : 'Wireframe'}
-                </span>
-              </button>
+              {viewportEngine === 'GOOGLE_EARTH_3D' ? (
+                <button
+                  type="button"
+                  onClick={() =>
+                    setGoogle3DMapMode((m) =>
+                      m === 'HYBRID' ? 'SATELLITE' : 'HYBRID'
+                    )
+                  }
+                  data-testid="toggle-google-3d-map-mode-btn"
+                  aria-label="Toggle Google 3D Photorealistic Map Mode (Hybrid or Satellite)"
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-800 border border-slate-700 text-slate-200 hover:text-white text-xs font-medium whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  <Globe className="w-3.5 h-3.5 text-amber-400" />
+                  <span>
+                    {google3DMapMode === 'HYBRID'
+                      ? '3D Hybrid Labels'
+                      : '3D Satellite Mesh'}
+                  </span>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() =>
+                    setFinishMode((m) =>
+                      m === 'REALISTIC'
+                        ? 'ARCHITECTURAL_CLAY'
+                        : m === 'ARCHITECTURAL_CLAY'
+                        ? 'BLUEPRINT'
+                        : 'REALISTIC'
+                    )
+                  }
+                  aria-label="Cycle 3D surface rendering style"
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-800 border border-slate-700 text-slate-200 hover:text-white text-xs font-medium whitespace-nowrap shrink-0"
+                >
+                  <Layers className="w-3.5 h-3.5 text-sky-400" />
+                  <span>
+                    {finishMode === 'REALISTIC'
+                      ? 'PBR Stone'
+                      : finishMode === 'ARCHITECTURAL_CLAY'
+                      ? 'Clay Model'
+                      : 'Wireframe'}
+                  </span>
+                </button>
+              )}
 
               <button
                 type="button"
@@ -2233,9 +2568,26 @@ export const Cleveland3DViewport: React.FC<Cleveland3DViewportProps> = ({
                     active: true,
                   };
                   requestRenderRef.current();
+                  setGoogle3DOrbiting(false);
+                  if (map3DRef.current?.map3d) {
+                    try {
+                      map3DRef.current.flyCameraTo({
+                        endCamera: {
+                          center: google3DCameraPose.center,
+                          range: google3DCameraPose.range,
+                          tilt: google3DCameraPose.tilt,
+                          heading: google3DCameraPose.heading,
+                          roll: 0,
+                        },
+                        durationMillis: 1200,
+                      });
+                    } catch {
+                      // Ignore
+                    }
+                  }
                 }}
                 aria-label="Reset 3D camera view"
-                className="p-1.5 rounded-lg bg-slate-800 border border-slate-700 text-slate-300 hover:text-white transition-colors"
+                className="p-1.5 rounded-lg bg-slate-800 border border-slate-700 text-slate-300 hover:text-white transition-colors cursor-pointer"
               >
                 <RotateCcw className="w-3.5 h-3.5" />
               </button>

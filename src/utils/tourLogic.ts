@@ -1276,6 +1276,180 @@ export function buildARDiscoverySharePayload(params: {
   };
 }
 
+export interface Google3DCameraPose {
+  center: {
+    lat: number;
+    lng: number;
+    altitude: number;
+  };
+  range: number;
+  tilt: number;
+  heading: number;
+  roll: number;
+  googleEarthUrl: string;
+  googleMaps3DUrl: string;
+}
+
+export interface Google3DARPinCoord {
+  factId: string;
+  title: string;
+  eraLabel: string;
+  category: string;
+  lat: number;
+  lng: number;
+  altitudeMeters: number;
+}
+
+/**
+ * Computes the Google Maps 3D (`<gmp-map-3d>` / Photorealistic 3D Tiles) and Google Earth Web
+ * camera pose (`center`, `range`, `tilt`, `heading`, `roll`) for a Cleveland landmark.
+ */
+export function buildGoogle3DCameraPreset(
+  landmark: LandmarkBlueprint,
+  overrideLocation?: GeoPoint | null
+): Google3DCameraPose {
+  const PRESETS: Record<
+    string,
+    { altitudeOffset: number; range: number; tilt: number; heading: number }
+  > = {
+    'terminal-tower': {
+      altitudeOffset: 85,
+      range: 460,
+      tilt: 67.5,
+      heading: 142,
+    },
+    'the-arcade': {
+      altitudeOffset: 42,
+      range: 340,
+      tilt: 65,
+      heading: 48,
+    },
+    'rock-hall': {
+      altitudeOffset: 48,
+      range: 420,
+      tilt: 68,
+      heading: 335,
+    },
+    'harbor-lighthouse': {
+      altitudeOffset: 28,
+      range: 380,
+      tilt: 66,
+      heading: 295,
+    },
+    'guardians-of-traffic': {
+      altitudeOffset: 44,
+      range: 440,
+      tilt: 67,
+      heading: 248,
+    },
+    'west-side-market': {
+      altitudeOffset: 38,
+      range: 350,
+      tilt: 65,
+      heading: 210,
+    },
+  };
+
+  const preset = PRESETS[landmark.id] || {
+    altitudeOffset: 45,
+    range: 420,
+    tilt: 67,
+    heading: 142,
+  };
+
+  const lat = overrideLocation?.lat ?? landmark.tourAnchor.lat;
+  const lng = overrideLocation?.lng ?? landmark.tourAnchor.lng;
+  const altitude = Math.round(
+    landmark.tourAnchor.elevationMeters + preset.altitudeOffset
+  );
+
+  // Format deep links to Google Earth Web 3D & Google Maps 3D Globe view
+  const googleEarthUrl = `https://earth.google.com/web/@${lat.toFixed(
+    6
+  )},${lng.toFixed(6)},${landmark.tourAnchor.elevationMeters}a,${
+    preset.range
+  }d,35y,${preset.heading}h,${preset.tilt}t,0r`;
+
+  const googleMaps3DUrl = `https://www.google.com/maps/@${lat.toFixed(
+    6
+  )},${lng.toFixed(6)},${preset.range}a,35y,${preset.heading}h,${preset.tilt}t/data=!3m1!1e3`;
+
+  return {
+    center: {
+      lat,
+      lng,
+      altitude,
+    },
+    range: preset.range,
+    tilt: preset.tilt,
+    heading: preset.heading,
+    roll: 0,
+    googleEarthUrl,
+    googleMaps3DUrl,
+  };
+}
+
+/**
+ * Projects a landmark's 3D AR Historical Fact offset (`arOffset3D`) into real-world
+ * WGS84 latitude, longitude, and relative-to-ground altitude (meters) for Google Maps 3D `<Marker3D>`.
+ */
+export function computeARFactGeoAltitudePoint(
+  landmark: LandmarkBlueprint,
+  fact: ARHistoricalFact,
+  overrideBaseLocation?: GeoPoint | null
+): Google3DARPinCoord {
+  const baseLat = overrideBaseLocation?.lat ?? landmark.tourAnchor.lat;
+  const baseLng = overrideBaseLocation?.lng ?? landmark.tourAnchor.lng;
+  const [sceneX, , sceneZ] = landmark.scenePosition3D;
+  const [fx, fy, fz] = fact.arOffset3D;
+
+  // Relative offset in local scene units (~8 meters per scene unit around the landmark footprint)
+  const dxUnits = fx - sceneX;
+  const dzUnits = fz - sceneZ;
+
+  // Convert local meter offset to degrees latitude/longitude at Cleveland's latitude (41.5°N)
+  const eastMeters = dxUnits * 8.5;
+  const southMeters = dzUnits * 8.5;
+  const dLat = -southMeters / 111111;
+  const dLng =
+    eastMeters / (111111 * Math.cos((baseLat * Math.PI) / 180));
+
+  const lat = Number((baseLat + dLat).toFixed(6));
+  const lng = Number((baseLng + dLng).toFixed(6));
+  const altitudeMeters = Math.max(18, Math.round(fy * 6.5));
+
+  return {
+    factId: fact.id,
+    title: fact.title,
+    eraLabel: fact.eraLabel,
+    category: fact.category,
+    lat,
+    lng,
+    altitudeMeters,
+  };
+}
+
+/**
+ * Builds the 3D elevated polyline coordinate array connecting all Cleveland tour stops
+ * for rendering via Google Maps 3D `<Polyline3D>`.
+ */
+export function buildGoogle3DWalkingCorridorCoordinates(
+  landmarks: LandmarkBlueprint[],
+  liveLocationsById?: Record<string, GeoPoint | undefined>
+): Array<{ lat: number; lng: number; altitude: number }> {
+  return [...landmarks]
+    .sort((a, b) => a.walkingOrder - b.walkingOrder)
+    .map((lm) => {
+      const liveLoc = liveLocationsById?.[lm.id];
+      return {
+        lat: liveLoc?.lat ?? lm.tourAnchor.lat,
+        lng: liveLoc?.lng ?? lm.tourAnchor.lng,
+        altitude: 22, // Relative to ground so the 3D trail floats cleanly above streets
+      };
+    });
+}
+
+
 
 
 

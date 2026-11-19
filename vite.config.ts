@@ -39,9 +39,18 @@ export default defineConfig(({mode}) => {
       },
     ],
     resolve: {
+      dedupe: ['react', 'react-dom'],
       alias: {
         '@': path.resolve(__dirname, '.'),
       },
+    },
+    optimizeDeps: {
+      include: [
+        'react',
+        'react-dom',
+        '@vis.gl/react-google-maps',
+        '@vis.gl/react-google-maps/3d',
+      ],
     },
     define: {
       'process.env.GOOGLE_MAPS_PLATFORM_KEY': JSON.stringify(mapsApiKey),
